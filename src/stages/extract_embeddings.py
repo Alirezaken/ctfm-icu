@@ -19,10 +19,17 @@ Requires: GPU; torch + transformers (not yet in the venv -- env-pin step).
 """
 from src.util import log
 
+# config names friendly encoders; map to the HuggingFace ids used to load them.
+ENCODER_HF_IDS = {
+    "rad-dino": "microsoft/rad-dino",
+    "clinical-longformer": "yikuan8/Clinical-Longformer",
+    "biomedclip": "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",
+}
+
 
 def run(cfg, force: bool = False):
-    cfg.require("encoders.image.hf_id", "encoders.notes.hf_id",
-                "lookback.hours")  # window recorded with the vectors
+    cfg.require("images.encoder", "text.encoder",
+                "pooling.look_back_window_hours")  # window recorded with the vectors
     log("extract_embeddings: not yet implemented (the one GPU stage).")
     raise NotImplementedError(
         "extract_embeddings pending: needs torch+transformers in the venv, "

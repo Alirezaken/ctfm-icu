@@ -10,6 +10,6 @@ from src.util import log
 
 
 def run(cfg, force: bool = False):
-    cfg.require("age.bands")  # banding must be fixed (and confirmed by Soroosh)
+    cfg.require("demographics.age_bands")  # banding fixed in config
     log("demographics: not yet implemented.")
     raise NotImplementedError("demographics pending: needs the estimate stage and confirmed age bands.")

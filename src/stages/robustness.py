@@ -10,8 +10,8 @@ from src.util import log
 
 
 def run(cfg, force: bool = False):
-    cfg.require("encoders.image_robustness.hf_id",
-                "robustness_swaps.lookback_hours_alt")
+    cfg.require("robustness_swaps.encoder_alt",
+                "robustness_swaps.look_back_window_alt_hours")
     log("robustness: not yet implemented.")
     raise NotImplementedError(
         "robustness pending: needs the estimate stage plus a 2nd CXR encoder and "

@@ -1,220 +1,211 @@
-# ============================================================================
-# config.yaml  --  THE single source of truth for the causal pipeline.
+# config.yaml — multimodal adjustment for ICU treatment-effect estimation
+# Single source of truth. main_causal.py reads only this file.
 #
-# One config holds every path, hyperparameter, seed, intervention definition,
-# RCT reference value, age band, look-back window, estimator setting and
-# bootstrap setting. No per-analysis config files.   (ALIREZA_INSTRUCTIONS.md §0)
-#
-# Path values support ${ENV} and ${ENV:default} interpolation, resolved by
-# src/cfg.py so the pipeline is portable across machines without editing source.
-#
-# NOTE markers below flag values that Soroosh must supply or confirm. They are
-# left null on purpose: never invent, estimate or placeholder a real number
-# (§0 "No fabrication"). The pipeline refuses to run a stage whose required
-# values are still null.
-# ============================================================================
+# Authored by Soroosh (values are fixed); the analyst sets only the machine paths
+# below. Folded in from config_Soroosh.yaml on 2026-06-21. Path strings support
+# ${ENV} / ${ENV:default} interpolation (resolved in src/cfg.py).
 
-# ---- paths -----------------------------------------------------------------
-# Results, embeddings and patient-derived tables NEVER live next to the code or
-# in $HOME (§0). storage_root is a sibling of the repo, on the work filesystem,
-# and env-overridable. The repo holds code only.
+# ----------------------------------------------------------------------
 paths:
+  # outputs: all embeddings, intermediates, results live here (outside the repo, §0)
   storage_root: ${CTFM_STORAGE:/home/woody/iwi5/iwi5406h/ctfm_storage}
+  uploads:      ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}      # raw datasets
+  outputs:      ${CTFM_STORAGE:/home/woody/iwi5/iwi5406h/ctfm_storage}/results
 
-  # --- inputs: reuse the link layer + cleaned event stream already built ---
-  # The data-prep pipeline (pipeline/*.py) reads these too, via the thin shim in
-  # pipeline/config.py, so each value is defined here once and only here (§0).
-  data_dir:         ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}
-  link_dir:         ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/link
-  event_stream:     ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/event_stream_clean   # cleaned copy, consumed by the causal stages
-  event_stream_raw: ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/event_stream         # raw stream from build_event_stream.py (never modified)
-
-  datasets_dir: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}
-  mimic_dir:    ${CTFM_MIMIC:/home/woody/iwi5/iwi5406h/New_Sp/Datasets/physionet.org/files/mimiciv/3.1}
-  ed_dir:       ${CTFM_ED:/home/woody/iwi5/iwi5406h/New_Sp/Datasets/mimic-iv-ed-2.2/ed}
+  # input sub-locations on this machine (reuse the existing link layer + event stream)
+  data_dir:     ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}
+  link_dir:     ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/link
+  event_stream: ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/event_stream_clean
+  mimic_dir:    ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/mimiciv/3.1
   cxr_master:   ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/mimic_master_list.csv
   cxr_images:   ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/preprocessed
-
-  notes_dir:    ${CTFM_NOTES:/home/woody/iwi5/iwi5406h/New_Sp/Datasets/physionet.org/files/mimic-iv-note/2.2}   # download pending
-  eicu_dir:     ${CTFM_EICU:/home/woody/iwi5/iwi5406h/New_Sp/Datasets/physionet.org/files/eicu-crd/2.0}         # upload pending
-
-  # external CXR sets: image-embedding quality gate only; never enter causal models (§1, §3)
+  notes_dir:    ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/mimic-iv-note/2.2
+  eicu_dir:     ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/eicu-crd/2.0
   external_cxr:
     padchest:    /home/vault/iwi5/iwi5406h/preprocessed_Padchest   # present (~46 GB)
-    chexpert:    null    # upload pending
-    chestxray14: null    # upload pending
+    chexpert:    null    # not on disk
+    chestxray14: null    # not on disk
 
-  # --- derived outputs (all created under storage_root) ---
-  embeddings:  embeddings    # frozen image/note vectors, keyed by identifier
-  cohorts:     cohorts       # per-intervention emulated-trial tables
-  checkpoints: checkpoints   # per-stage resume markers
-  results:     results       # the 10 result CSVs (§7)
+  # storage subdirectories (created under storage_root)
+  embeddings:  embeddings
+  cohorts:     cohorts
+  checkpoints: checkpoints
+  results:     results
 
-# ---- reproducibility (§8) --------------------------------------------------
-seed: 42                     # the single fixed seed, used everywhere
+# ----------------------------------------------------------------------
+run:
+  seed: 42
+  effect_measure: risk_difference      # active arm minus comparator
+  effect_scale: percentage_points
+  effect_decimals: 1
+  multiple_testing: benjamini_hochberg
+
 bootstrap:
-  n_resamples: 10000         # patient-level (cluster) bootstrap, fixed count (§8 Kind B)
-  cluster_key: subject_id    # resample patients, not rows
-  # the same resample indices are reused across conditions so paired contrasts are valid
+  n_resamples: 10000
+  unit: patient                        # patient-level cluster bootstrap
+  reuse_indices_across_conditions: true
 
-# ---- pooling / look-back window (§3) ---------------------------------------
-# Mean-pool pre-time-zero images, and separately notes, within this window.
-# NOTE: numeric value not given in the instructions -- confirm with Soroosh.
-lookback:
-  hours: 48                  # analyst's call (§0: a config param, not a Soroosh input).
-                             # Pool pre-time-zero images/notes from the 48h before t0.
-  pooling: mean              # primary pooling rule; robustness swaps to 'max' (§9.11)
+# ----------------------------------------------------------------------
+dataset_versions:                      # pin exactly; record in manifest.csv
+  mimic_iv: "3.1"
+  mimic_iv_ed: "2.2"
+  mimic_iv_note: "2.2"
+  mimic_cxr_jpg: "2.1.0"
+  eicu_crd: "2.0"
+  chexpert: "snapshot_in_house"
+  chestxray14: "snapshot_in_house"
+  padchest: "snapshot_in_house"
+
+# ----------------------------------------------------------------------
+images:
+  encoder: rad-dino
+  size: 224
+  views: [PA, AP, AP_erect, AP_supine]   # frontal only; lateral dropped
+  resize_once_to_storage: true
+
+text:
+  encoder: clinical-longformer
+  max_tokens: 4096
+  variants:
+    notes_clinical: { exclude_radiology_reports: true }   # default note modality
+    notes_all:      { exclude_radiology_reports: false }  # used only in decomposition
+
+pooling:
+  rule: mean
+  look_back_window_hours: 48           # only pre-time-zero data within this window
+
+# ----------------------------------------------------------------------
+estimator:
+  method: aipw                         # cross-fitted AIPW everywhere
+  nuisance_model: lightgbm
+  cross_fitting_folds: 5
+
+conditions: [naive, structured, plus_notes, plus_imaging_only, full, design_based]
+
 robustness_swaps:
-  lookback_hours_alt: 24     # alternate window for the robustness swap
+  encoder_alt: biomedclip
+  estimator_alt: tmle
+  look_back_window_alt_hours: 24
   pooling_alt: max
 
-# ---- age & sex (§1) --------------------------------------------------------
-age:
-  anchor_age_cap: 91         # MIMIC-IV shifts ages >89 to this anchor; handle top band
-  drop_nonpositive: true     # keep strictly positive ages only (drop empty and exactly 0)
-  # bins are (lower, upper], right-inclusive / left-exclusive, first bin above zero.
-  # analyst's call; top band ends at the 91 anchor so shifted >89 ages land there.
-  bands: [[0, 18], [18, 45], [45, 55], [55, 65], [65, 75], [75, 91]]
+# ----------------------------------------------------------------------
+demographics:
+  age_at: time_zero
+  drop_age_empty_or_zero: true
+  age_bands: ["(0,40]", "(40,55]", "(55,70]", "(70,120]"]   # right-inclusive, left-exclusive
+  sex_levels: [F, M]
+  mimic_age_over_89_anchor_note: "MIMIC-IV shifts ages >89 to a single anchor; top band absorbs it"
 
-# ---- embedding encoders (§3, frozen, extracted once) -----------------------
-encoders:
-  image:
-    name: rad-dino
-    hf_id: microsoft/rad-dino       # frozen, off the shelf, no fine-tuning
-    input_size: 224                 # resize 512->224 once, save to storage, extract from saved
-    view_filter: [PA, AP, "AP AXIAL", "AP LLD", "AP RLD"]   # frontal only; drop lateral
-  image_robustness:
-    name: null                      # TODO: a second frozen CXR encoder for the robustness swap (§9.11)
-    hf_id: null
-  notes:
-    name: clinical-longformer
-    hf_id: yikuan8/Clinical-Longformer
-    max_tokens: 4096
-    # two note-proxy variants per patient:
-    variants: [notes_clinical, notes_all]   # clinical = radiology reports EXCLUDED (default)
-    default_variant: notes_clinical          # notes_all used only in decomposition (§6.3)
-
-# ---- estimator (§5) --------------------------------------------------------
-estimator:
-  method: aipw                 # cross-fitted AIPW everywhere; TMLE only as robustness swap
-  effect_measure: risk_difference
-  effect_units: percentage_points
-  crossfit_folds: 5            # cross-fitting always on (embeddings are high-dimensional)
-  nuisance:
-    model: lightgbm            # GBT for both propensity and outcome
-    params: {}                 # TODO: pin nuisance hyperparameters (recorded in manifest)
-  trim_nonoverlap: true        # trim non-overlap propensity regions; report ESS + CI width
-  censoring: ipcw              # censoring weights in-estimator; same covariates as outcome model
-
-# ---- adjustment conditions (§5), all on the shared all-modality cohort -----
-conditions:
-  - naive               # unadjusted
-  - structured          # structured covariates at time zero
-  - plus_notes          # structured + notes_clinical
-  - plus_imaging_only   # structured + image proxy
-  - full                # structured + notes_clinical + image proxy
-  - design_based        # expert-curated confounder set per intervention (below), with AIPW
-
-# ---- interventions (§2) ----------------------------------------------------
-# Four interventions (§2 says "five" but lists four; Soroosh confirmed four is
-# correct, the "five" was a typo). Each: eligibility, time-zero, the two strategies, primary
-# outcome + horizon, negative-control outcome(s), and the RCT reference effect as
-# a risk difference with CI at that horizon (fixed-effect meta-analytic RD where
-# more than one trial). Reference values are provided by Soroosh -- left null.
+# ----------------------------------------------------------------------
+# INTERVENTIONS
+# Each: eligibility, time_zero, the two arms, outcome+horizon, negative control,
+# the RCT reference (active minus comparator, percentage points), and the
+# expert structured confounder set used by the design_based condition.
+# ----------------------------------------------------------------------
 interventions:
 
-  fluids_sepsis:                # <-- pipeline starts here (§9.5: first intervention)
-    label: Conservative vs liberal fluid strategy in sepsis
-    trials: [CLOVERS, CLASSIC]
-    # Operationalized from CLOVERS (NEJM 2023) + CLASSIC (NEJM 2022).
-    # PENDING SOROOSH REVIEW (see docs/QUESTIONS_FOR_SOROOSH.md) — these are the
-    # analyst's translation of the published protocols to MIMIC, not his sign-off.
+  prone_positioning:
+    role: positive_control
     eligibility:
-      min_age: 18
-      sepsis_definition: sepsis3          # suspected infection + acute SOFA rise >=2
-      require_hypotension: true           # sepsis-induced hypotension / septic shock
-      hypotension_def: "MAP<65 mmHg or SBP<90 mmHg or vasopressor started"
-      min_initial_crystalloid_ml: 1000    # >=1 L crystalloid in early resuscitation
-      enrollment_window_h: 24             # eligibility assessed within 24h of sepsis onset
-      setting: icu
-    time_zero:
-      anchor: sepsis_hypotension_after_initial_fluids
-      definition: "first MAP<65 / SBP<90 / vasopressor start AFTER >=1000 mL crystalloid, within enrollment_window_h"
-    strategies:
-      treated: conservative
-      comparator: liberal
-      assignment_window_h: 24             # strategy assessed over first 24h after t0
-      classifier: crystalloid_volume_24h  # dichotomize on 24h post-t0 cumulative crystalloid
-      conservative_max_crystalloid_ml: 2000   # <= -> conservative; > -> liberal  [DESIGN CHOICE — review]
-    primary_outcome:
-      name: all_cause_mortality
-      source: dod                         # MIMIC date-of-death
-    horizon_days: 90                      # 90-day mortality (both trials)
-    negative_controls:                    # PROPOSED — treatment cannot plausibly affect; confirm
-      - {name: hospital_acquired_pressure_injury, type: binary}
-    rct_reference:              # NULL — Soroosh provides (fixed-effect meta-analytic RD of CLOVERS+CLASSIC, §2)
-      risk_difference_pp: null
-      ci_low_pp: null
-      ci_high_pp: null
-    design_based_confounders: null   # NULL — "listed in config by me" = Soroosh (§5)
+      ards_severe: true
+      pao2_fio2_lt: 150
+      fio2_ge: 0.6
+      peep_ge: 5
+      invasive_ventilation: true
+      within_hours_of_intubation: 36
+    time_zero: first_qualifying_severe_hypoxemia_in_icu
+    arms:
+      active: prone_session_initiated_within_24h
+      comparator: remained_supine
+    outcome: all_cause_mortality
+    horizon_days: 28
+    negative_control_outcome: icu_acquired_uti
+    imaging_confounder_label: edema          # MIMIC-CXR-JPG label for the validity probe
+    rct_reference:
+      source: PROSEVA
+      risk_difference: -16.8
+      ci: [-24.5, -9.1]
+      horizon_days: 28
+      target_type: nonzero
+    expert_confounders: [age, sex, bmi, sofa_total, pao2_fio2, peep, fio2, plateau_pressure,
+      vasopressor_dose, lactate, creatinine, gcs, hours_since_intubation, immunosuppression]
 
-  prone_ards:
-    label: Prone vs supine positioning in ARDS
-    trials: [PROSEVA]
-    eligibility: null
-    time_zero: null
-    strategies: {treated: prone, comparator: supine}
-    primary_outcome: null
-    horizon_days: null
-    negative_controls: null
-    rct_reference: {risk_difference_pp: null, ci_low_pp: null, ci_high_pp: null}
-    design_based_confounders: null
+  fluids_sepsis:
+    role: null_calibration_imaging
+    eligibility:
+      suspected_infection: true
+      sepsis_induced_hypotension: true       # SBP<100 after >=1L crystalloid, or vasopressor
+      within_hours_of_icu_admit: 24
+    time_zero: onset_sepsis_induced_hypotension
+    arms:
+      active: restrictive_fluids             # <30 ml/kg crystalloid in 24h OR vasopressor before 30 ml/kg
+      comparator: liberal_fluids
+    outcome: all_cause_mortality
+    horizon_days: 90
+    negative_control_outcome: icu_acquired_uti
+    imaging_confounder_label: edema          # pulmonary edema is the latent confounder here
+    rct_reference:
+      source: [CLOVERS, CLASSIC]             # both 90-day, both null -> fixed-effect meta-analytic
+      risk_difference: -0.5                   # verified: CLOVERS -0.9 (14.0 vs 14.9), CLASSIC +0.2 (42.3 vs 42.1)
+      ci: [-3.4, 2.3]                         # fixed-effect inverse-variance meta of the two
+      horizon_days: 90
+      target_type: null
+    expert_confounders: [age, sex, sofa_total, lactate, mean_arterial_pressure, vasopressor_dose,
+      creatinine, urine_output_6h, crystalloid_volume_pre_t0, heart_failure_history, ckd_history,
+      infection_source]
 
-  rrt_aki:
-    label: Early vs delayed renal replacement therapy in AKI
-    trials: [STARRT-AKI]
-    eligibility: null
-    time_zero: null
-    strategies: {treated: early, comparator: delayed}
-    primary_outcome: null
-    horizon_days: null
-    negative_controls: null
-    rct_reference: {risk_difference_pp: null, ci_low_pp: null, ci_high_pp: null}
-    design_based_confounders: null
+  rrt_timing:
+    role: null_calibration_notes
+    eligibility:
+      aki_kdigo_stage_in: [2, 3]
+      no_urgent_rrt_indication: true         # no severe hyperkalemia/acidosis/uremia/overload
+      in_icu: true
+    time_zero: first_kdigo_stage2_3_without_urgent_indication
+    arms:
+      active: accelerated_rrt_within_12h
+      comparator: standard_delayed_rrt
+    outcome: all_cause_mortality
+    horizon_days: 90
+    negative_control_outcome: icu_acquired_uti
+    notes_confounder: clinician_urgency_and_trajectory_gestalt
+    rct_reference:
+      source: STARRT-AKI
+      risk_difference: 0.2
+      ci: [-3.1, 3.9]                        # from RR 1.00 (0.93-1.09) at ~43.7% baseline
+      horizon_days: 90
+      target_type: null
+    expert_confounders: [age, sex, sofa_total, creatinine, bun, potassium, urine_output_6h,
+      bicarbonate, ph, fluid_balance_cumulative, vasopressor_use, ckd_history, mechanical_ventilation]
 
   transfusion_threshold:
-    label: Restrictive vs liberal red-cell transfusion threshold
-    trials: [TRICC, TRISS]
-    eligibility: null
-    time_zero: null
-    strategies: {treated: restrictive, comparator: liberal}
-    primary_outcome: null
-    horizon_days: null
-    negative_controls: null
-    rct_reference: {risk_difference_pp: null, ci_low_pp: null, ci_high_pp: null}
-    design_based_confounders: null
+    role: null_calibration_structured_anchor
+    eligibility:
+      septic_shock: true
+      hemoglobin_lt: 9.0
+      in_icu: true
+    time_zero: first_hemoglobin_lt_9_in_septic_shock
+    arms:
+      active: restrictive_transfuse_at_hb_le_7
+      comparator: liberal_transfuse_at_hb_le_9
+    outcome: all_cause_mortality
+    horizon_days: 90
+    negative_control_outcome: icu_acquired_uti
+    structured_confounder: hemoglobin        # key confounder is structured -> imaging should not help
+    rct_reference:
+      source: TRISS                          # primary; horizon and population match
+      risk_difference: -2.0
+      ci: [-9.9, 4.1]                        # from RR 0.94 (0.78-1.09) at 45% baseline
+      horizon_days: 90
+      target_type: null
+      sensitivity_reference:                 # different horizon/population -> not pooled, sensitivity only
+        source: TRICC
+        risk_difference: -4.6
+        ci: [-10.2, 0.8]
+        horizon_days: 30
+    expert_confounders: [age, sex, hemoglobin, sofa_total, lactate, coronary_artery_disease,
+      active_bleeding, platelets, vasopressor_use, creatinine]
 
-# ---- CheXpert structured labels (§1, §6.5) ---------------------------------
-# The 14 CheXpert findings as named in mimic_master_list.csv. Used by the link
-# layer (cxr_studies labels) and the validity probe (Edema). Column encoding:
-# 1=positive, 0=negative, 2=not-mentioned, 3=uncertain.
-chexpert_labels:
-  - atelectasis
-  - cardiomegaly
-  - consolidation
-  - edema
-  - enlarged_cardiomediastinum
-  - fracture
-  - lung_lesion
-  - lung_opacity
-  - no_finding
-  - pleural_effusion
-  - pleural_other
-  - pneumonia
-  - pneumothorax
-  - support_devices
-
-# ---- validity probe targets (§6.5) -----------------------------------------
-probe:
-  image_target_confounder: edema     # MIMIC-CXR-JPG Edema label predicts pulmonary edema
-  notes_target_confounder: null      # TODO(Soroosh): the note proxy's target confounder
+# ----------------------------------------------------------------------
+external:
+  dataset: eicu_crd
+  conditions: [structured, plus_notes]       # no imaging available externally

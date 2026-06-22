@@ -118,29 +118,27 @@ def build_manifest(cfg) -> int:
         rows.append((k, "" if v is None else str(v)))
 
     # reproducibility
-    add("seed", cfg.get("seed"))
+    add("seed", cfg.get("run.seed"))
     add("bootstrap.n_resamples", cfg.get("bootstrap.n_resamples"))
-    add("bootstrap.cluster_key", cfg.get("bootstrap.cluster_key"))
+    add("bootstrap.unit", cfg.get("bootstrap.unit"))
     # estimator
     add("estimator.method", cfg.get("estimator.method"))
-    add("estimator.effect_measure", cfg.get("estimator.effect_measure"))
-    add("estimator.effect_units", cfg.get("estimator.effect_units"))
-    add("estimator.crossfit_folds", cfg.get("estimator.crossfit_folds"))
-    add("estimator.nuisance_model", cfg.get("estimator.nuisance.model"))
+    add("effect_measure", cfg.get("run.effect_measure"))
+    add("effect_scale", cfg.get("run.effect_scale"))
+    add("estimator.cross_fitting_folds", cfg.get("estimator.cross_fitting_folds"))
+    add("estimator.nuisance_model", cfg.get("estimator.nuisance_model"))
     # encoders
-    add("encoder.image", cfg.get("encoders.image.hf_id"))
-    add("encoder.image.input_size", cfg.get("encoders.image.input_size"))
-    add("encoder.notes", cfg.get("encoders.notes.hf_id"))
-    add("encoder.notes.max_tokens", cfg.get("encoders.notes.max_tokens"))
-    # pooling / window / bands (some still null -> empty)
-    add("pooling", cfg.get("lookback.pooling"))
-    add("lookback_hours", cfg.get("lookback.hours"))
-    add("age_bands", cfg.get("age.bands"))
-    # dataset versions (§1, pinned)
-    for k, v in {
-        "MIMIC-IV": "3.1", "MIMIC-IV-ED": "2.2", "MIMIC-IV-Note": "2.2",
-        "MIMIC-CXR-JPG": "2.1.0", "eICU-CRD": "2.0",
-    }.items():
+    add("encoder.image", cfg.get("images.encoder"))
+    add("encoder.image.size", cfg.get("images.size"))
+    add("encoder.text", cfg.get("text.encoder"))
+    add("encoder.text.max_tokens", cfg.get("text.max_tokens"))
+    add("encoder.image_alt", cfg.get("robustness_swaps.encoder_alt"))
+    # pooling / window / bands
+    add("pooling.rule", cfg.get("pooling.rule"))
+    add("look_back_window_hours", cfg.get("pooling.look_back_window_hours"))
+    add("age_bands", cfg.get("demographics.age_bands"))
+    # dataset versions (§1, pinned in config)
+    for k, v in (cfg.get("dataset_versions") or {}).items():
         add(f"dataset_version.{k}", v)
     # package versions of the run environment
     for pkg in ["numpy", "pandas", "pyarrow", "scipy", "scikit-learn",

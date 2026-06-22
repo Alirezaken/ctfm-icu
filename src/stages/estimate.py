@@ -20,9 +20,9 @@ from src.util import log
 
 
 def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
-    cfg.require("estimator.method", "estimator.crossfit_folds",
-                "bootstrap.n_resamples", "seed",
-                f"interventions.{intervention}.rct_reference.risk_difference_pp")
+    cfg.require("estimator.method", "estimator.cross_fitting_folds",
+                "bootstrap.n_resamples", "run.seed",
+                f"interventions.{intervention}.rct_reference.risk_difference")
     log(f"estimate[{intervention}]: not yet implemented.")
     raise NotImplementedError(
         "estimate pending: needs the emulated cohort, stored embeddings, lightgbm "

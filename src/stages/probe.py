@@ -14,7 +14,7 @@ from src.util import log
 
 
 def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
-    cfg.require("probe.image_target_confounder")  # note target pending Soroosh
+    cfg.require(f"interventions.{intervention}.imaging_confounder_label")
     log("probe: not yet implemented (validity gate).")
     raise NotImplementedError(
         "probe pending: needs stored image/note embeddings. Image side can run "

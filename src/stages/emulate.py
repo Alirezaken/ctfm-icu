@@ -27,9 +27,9 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
         raise KeyError(f"unknown intervention '{intervention}'")
     cfg.require(f"interventions.{intervention}.eligibility",
                 f"interventions.{intervention}.time_zero",
-                f"interventions.{intervention}.primary_outcome",
+                f"interventions.{intervention}.outcome",
                 f"interventions.{intervention}.horizon_days",
-                "lookback.hours")
+                "pooling.look_back_window_hours")
     log(f"emulate[{intervention}]: not yet implemented.")
     raise NotImplementedError(
         "emulate pending implementation: trial definitions are operationalized in "
