@@ -1,0 +1,30 @@
+# --- Data: MIMIC is credentialed PHI -- NEVER commit to git ---
+/Datasets/
+/data/
+/ctfm_storage/          # storage_root (if ever placed in-repo): results, embeddings, patient tables
+*.parquet
+*.csv
+*.csv.gz
+*.zip
+wget-log*
+
+# --- Python environment & caches ---
+/.venv/
+/.tmp/
+/.pipcache/
+__pycache__/
+*.pyc
+
+# --- SLURM logs & scratch ---
+/logs/
+
+# --- Private docs, instructions & correspondence: repo is code-only ---
+# Ignore the whole docs/ tree (instructions, proposals, legacy notes, PDFs) ...
+/docs/
+# ... and any stray markdown anywhere ...
+*.md
+# ... except a single top-level README.md, committed separately.
+!/README.md
+
+# --- misc ---
+.DS_Store
