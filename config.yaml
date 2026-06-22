@@ -22,11 +22,16 @@ paths:
   storage_root: ${CTFM_STORAGE:/home/woody/iwi5/iwi5406h/ctfm_storage}
 
   # --- inputs: reuse the link layer + cleaned event stream already built ---
-  data_dir:     ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}
-  link_dir:     ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/link
-  event_stream: ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/event_stream_clean
+  # The data-prep pipeline (pipeline/*.py) reads these too, via the thin shim in
+  # pipeline/config.py, so each value is defined here once and only here (§0).
+  data_dir:         ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}
+  link_dir:         ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/link
+  event_stream:     ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/event_stream_clean   # cleaned copy, consumed by the causal stages
+  event_stream_raw: ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/event_stream         # raw stream from build_event_stream.py (never modified)
 
   datasets_dir: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}
+  mimic_dir:    ${CTFM_MIMIC:/home/woody/iwi5/iwi5406h/New_Sp/Datasets/physionet.org/files/mimiciv/3.1}
+  ed_dir:       ${CTFM_ED:/home/woody/iwi5/iwi5406h/New_Sp/Datasets/mimic-iv-ed-2.2/ed}
   cxr_master:   ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/mimic_master_list.csv
   cxr_images:   ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/preprocessed
 
@@ -188,6 +193,26 @@ interventions:
     negative_controls: null
     rct_reference: {risk_difference_pp: null, ci_low_pp: null, ci_high_pp: null}
     design_based_confounders: null
+
+# ---- CheXpert structured labels (§1, §6.5) ---------------------------------
+# The 14 CheXpert findings as named in mimic_master_list.csv. Used by the link
+# layer (cxr_studies labels) and the validity probe (Edema). Column encoding:
+# 1=positive, 0=negative, 2=not-mentioned, 3=uncertain.
+chexpert_labels:
+  - atelectasis
+  - cardiomegaly
+  - consolidation
+  - edema
+  - enlarged_cardiomediastinum
+  - fracture
+  - lung_lesion
+  - lung_opacity
+  - no_finding
+  - pleural_effusion
+  - pleural_other
+  - pneumonia
+  - pneumothorax
+  - support_devices
 
 # ---- validity probe targets (§6.5) -----------------------------------------
 probe:
