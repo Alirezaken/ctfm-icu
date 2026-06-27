@@ -9,6 +9,7 @@ from importlib import import_module
 STAGES = [
     "link",                # §9.3  build/verify MIMIC-IV intersect MIMIC-CXR linkage
     "extract_embeddings",  # §9.4  resize+save images, extract frozen image/note vectors
+    "extract_external_cxr",# §3    RAD-DINO embeddings for external CXR sets (quality gate)
     "emulate",             # §9.5  build emulated-trial cohort(s)
     "probe",               # §9.6  validity probe (gate before estimating)
     "estimate",            # §9.7  AIPW for all conditions; main effects + controls

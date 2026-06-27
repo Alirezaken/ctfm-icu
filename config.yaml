@@ -21,10 +21,20 @@ paths:
   cxr_images:   ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/preprocessed
   notes_dir:    ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/mimic-iv-note/2.2
   eicu_dir:     ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/eicu-crd/2.0
-  external_cxr:
-    padchest:    /home/vault/iwi5/iwi5406h/preprocessed_Padchest   # present (~46 GB)
-    chexpert:    null    # not on disk
-    chestxray14: null    # not on disk
+  external_cxr:                  # §3 image-embedding quality gate (RAD-DINO over external CXR sets)
+    padchest:
+      csv:         /home/hpc/iwi5/iwi5406h/fix10april/Project/padchest_trainval.csv
+      images_root: /home/vault/iwi5/iwi5406h/preprocessed_Padchest
+      id_col:      ImageID
+      view_col:    view
+      path:        "{images_root}/{ImageDir}/{ImageID}"
+    chestxray14:
+      csv:         ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/final_cxr14_master_list.csv
+      images_root: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/chestxray14/preprocessed
+      id_col:      image_id
+      view_col:    view_position
+      path:        "{images_root}/{img_rel_path}"
+    chexpert: null    # upload pending; add {csv, images_root, id_col, view_col, path} then re-run
 
   # storage subdirectories (created under storage_root)
   embeddings:  embeddings
@@ -209,3 +219,24 @@ interventions:
 external:
   dataset: eicu_crd
   conditions: [structured, plus_notes]       # no imaging available externally
+
+# ----------------------------------------------------------------------
+# §3 image-embedding QUALITY GATE (a check, not a result): does RAD-DINO
+# separate known findings on EXTERNAL chest-X-ray datasets? These never enter
+# the causal models. Machine paths set by the analyst. CheXpert added when uploaded.
+quality_gate:
+  sample_per_dataset: 30000                   # gate, not a result -> a sample suffices
+  probe_labels: [edema, effusion, cardiomegaly]
+  datasets:
+    padchest:
+      images: /home/vault/iwi5/iwi5406h/preprocessed_Padchest
+      master: /home/hpc/iwi5/iwi5406h/fix10april/Project/padchest_trainval.csv
+      path_cols: [ImageDir, ImageID]          # abs path = images/ImageDir/ImageID
+      view_col: view
+      label_map: {edema: pulmonary_edema, effusion: pleural_effusion, cardiomegaly: cardiomegaly}
+    chestxray14:
+      images: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/chestxray14/preprocessed
+      master: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/final_cxr14_master_list.csv
+      path_col: img_rel_path                  # abs path = images/img_rel_path
+      view_col: view_position
+      label_map: {edema: edema, effusion: effusion, cardiomegaly: cardiomegaly}

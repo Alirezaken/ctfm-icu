@@ -33,3 +33,21 @@ def read_modality(cfg, modality: str, itemids=None, columns=None) -> pd.DataFram
 def link(cfg, name: str) -> pd.DataFrame:
     """Read a relational link-layer table by file stem (e.g. 'patients')."""
     return pd.read_csv(cfg.input("link_dir") / f"{name}.csv")
+
+
+def load_embeddings(cfg, modality: str):
+    """Load stored embeddings for 'images' or 'notes'.
+
+    Returns (index_df, V) where V[i] is the float32 vector for index_df row i.
+    The per-shard/source vector files are concatenated in the same sorted order
+    used to build index.csv, so rows align positionally.
+    """
+    import numpy as np
+    base = cfg.storage("embeddings", modality)
+    idx = pd.read_csv(base / "index.csv")
+    pat = "vectors_p*.npy" if modality == "images" else "vectors_*.npy"
+    vfiles = sorted(base.glob(pat))
+    V = np.concatenate([np.load(f) for f in vfiles], axis=0).astype("float32")
+    if len(V) != len(idx):
+        raise ValueError(f"{modality}: {len(V)} vectors vs {len(idx)} index rows")
+    return idx, V

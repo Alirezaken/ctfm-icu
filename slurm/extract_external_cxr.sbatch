@@ -1,14 +1,14 @@
 #!/bin/bash -l
-# §9.4 extract_embeddings -- the one GPU stage (RAD-DINO + Clinical-Longformer).
-# Uses sp_env (torch+transformers+CUDA); the CPU causal .venv has no torch.
+# §3 quality gate -- RAD-DINO embeddings for the external CXR sets
+# (PadChest, ChestX-ray14, and CheXpert once uploaded). Uses sp_env (torch+CUDA).
 #
-# Submit:  sbatch slurm/extract_embeddings.sbatch
-# Monitor: squeue -u $USER ; tail -f logs/extract_embeddings_*.log
+# Submit:  sbatch slurm/extract_external_cxr.sbatch
+# Monitor: squeue -u $USER ; tail -f logs/extract_external_cxr_*.log
 #
-#SBATCH --job-name=extract_embeddings
-#SBATCH --partition=a100
-#SBATCH --gres=gpu:a100:1
-#SBATCH --time=12:00:00
+#SBATCH --job-name=extract_external_cxr
+#SBATCH --partition=work
+#SBATCH --gres=gpu:1
+#SBATCH --time=10:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --export=NONE
 #SBATCH --output=/home/woody/iwi5/iwi5406h/New_Sp/logs/%x_%j.log
@@ -27,5 +27,5 @@ export TRANSFORMERS_OFFLINE=1
 cd /home/woody/iwi5/iwi5406h/New_Sp
 echo "host=$(hostname)  python=$(which python)  start=$(date)"
 python -c "import torch; print('cuda available:', torch.cuda.is_available())"
-python -u main_causal.py --stage extract_embeddings
-echo "extract_embeddings DONE  end=$(date)"
+python -u main_causal.py --stage extract_external_cxr
+echo "extract_external_cxr DONE  end=$(date)"

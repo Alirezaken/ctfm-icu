@@ -223,6 +223,132 @@ def _embed_notes(cfg, ckpt, force):
         log(f"notes index -> {out_dir/'index.csv'}")
 
 
+# --------------------------------------------------------------------------- §3 quality gate
+def _ka(values_pct):
+    b = np.asarray(values_pct, float); b = b[np.isfinite(b)]
+    r = lambda x: round(float(x), 1)
+    return r(np.mean(b)), r(np.std(b, ddof=1)), r(np.percentile(b, 2.5)), r(np.percentile(b, 97.5))
+
+
+def _embed_paths(proc, model, paths, dev, size, batch=64):
+    """Embed a list of image paths with the loaded encoder; returns (V, ok_mask)."""
+    import torch
+    from PIL import Image
+    vecs, ok, buf = [], [], []
+
+    def flush(imgs):
+        inp = proc(images=imgs, return_tensors="pt").to(dev)
+        with torch.no_grad():
+            o = model(**inp)
+        v = getattr(o, "pooler_output", None)
+        if v is None:
+            v = o.last_hidden_state[:, 0]
+        return v.float().cpu().numpy().astype(np.float16)
+
+    for p in paths:
+        try:
+            im = Image.open(p).convert("RGB").resize((size, size))
+        except Exception:
+            ok.append(False); continue
+        ok.append(True); buf.append(im)
+        if len(buf) == batch:
+            vecs.append(flush(buf)); buf = []
+    if buf:
+        vecs.append(flush(buf))
+    V = np.concatenate(vecs, axis=0).astype("float32") if vecs else np.zeros((0, 1))
+    return V, np.array(ok)
+
+
+def _quality_gate(cfg, ckpt, force):
+    """Embed external CXR sets with RAD-DINO and check the embeddings separate
+    known findings (linear probe, AUROC/AUPRC). A check, not a result -> probe.csv
+    with modality 'image@<dataset>'. These embeddings never enter the causal models."""
+    import torch
+    from transformers import AutoModel, AutoImageProcessor
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import roc_auc_score, average_precision_score
+    from src.stats import cluster_bootstrap_indices
+
+    qg = cfg.get("quality_gate")
+    if not qg:
+        log("quality gate: no config; skip"); return
+    labels = qg.get("probe_labels", [])
+    sample = int(qg.get("sample_per_dataset", 30000))
+    seed = int(cfg.get("run.seed", 42))
+    size = int(cfg.get("images.size", 224))
+    dev = _device(torch)
+    hf = _hf_id(cfg, "images.encoder")
+    proc = AutoImageProcessor.from_pretrained(hf)
+    model = AutoModel.from_pretrained(hf).eval().to(dev)
+
+    rows = []
+    for ds, spec in qg["datasets"].items():
+        if ckpt.done(f"gate_{ds}") and not force:
+            log(f"  gate {ds}: cached"); continue
+        master = spec.get("master")
+        if not master or not os.path.exists(master):
+            log(f"  gate {ds}: master missing ({master}); skip"); continue
+        df = pd.read_csv(master, low_memory=False)
+        vc = spec.get("view_col")
+        if vc and vc in df:
+            df = df[df[vc].map(_is_frontal)]
+        df = df.reset_index(drop=True)
+        if "path_cols" in spec:
+            a, b = spec["path_cols"]
+            df["_p"] = spec["images"] + "/" + df[a].astype(str) + "/" + df[b].astype(str)
+        else:
+            df["_p"] = spec["images"] + "/" + df[spec["path_col"]].astype(str)
+        if len(df) > sample:
+            df = df.sample(sample, random_state=seed).reset_index(drop=True)
+
+        t0 = time.time()
+        V, ok = _embed_paths(proc, model, df["_p"].tolist(), dev, size)
+        df = df[ok].reset_index(drop=True)
+        log(f"  gate {ds}: embedded {len(df):,} frontal images in {time.time()-t0:,.0f}s")
+
+        pidcol = next((c for c in ("PatientID", "patient_id") if c in df), None)
+        rng = np.random.default_rng(seed)
+        if pidcol:
+            pats = df[pidcol].unique()
+            test_pats = set(rng.choice(pats, size=max(1, int(len(pats) * 0.3)), replace=False))
+            te = df[pidcol].isin(test_pats).to_numpy()
+        else:
+            te = rng.random(len(df)) < 0.3
+        tr = ~te
+        sc = StandardScaler().fit(V[tr])
+        Vt, Ve = sc.transform(V[tr]), sc.transform(V[te])
+        subj = (df.loc[te, pidcol].to_numpy() if pidcol else np.arange(int(te.sum())))
+
+        for lab in labels:
+            col = spec.get("label_map", {}).get(lab)
+            if not col or col not in df:
+                continue
+            y = (pd.to_numeric(df[col], errors="coerce") == 1).astype(int).to_numpy()
+            if y[tr].sum() < 20 or y[te].sum() < 10:
+                log(f"    {ds}/{lab}: too few positives (tr={y[tr].sum()}, te={y[te].sum()}); skip")
+                continue
+            clf = LogisticRegression(max_iter=1000).fit(Vt, y[tr])
+            p = clf.predict_proba(Ve)[:, 1]; yte = y[te]
+            auroc = roc_auc_score(yte, p) * 100; auprc = average_precision_score(yte, p) * 100
+            br, bp = [], []
+            for bidx in cluster_bootstrap_indices(subj, 1000, seed):
+                yb, pb = yte[bidx], p[bidx]
+                if yb.min() == yb.max():
+                    continue
+                br.append(roc_auc_score(yb, pb) * 100); bp.append(average_precision_score(yb, pb) * 100)
+            rm, rs, rl, rh = _ka(br); pm, ps, pl, ph = _ka(bp)
+            rows.append({"modality": f"image@{ds}", "target_confounder": lab,
+                         "auroc_mean": rm, "auroc_std": rs, "auroc_ci_low": rl, "auroc_ci_high": rh,
+                         "auprc_mean": pm, "auprc_std": ps, "auprc_ci_low": pl, "auprc_ci_high": ph})
+            log(f"    {ds}/{lab}: AUROC={auroc:.1f} AUPRC={auprc:.1f}")
+        ckpt.mark(f"gate_{ds}", n=int(len(df)))
+
+    if rows:
+        R.append_rows(cfg, "probe.csv", rows)
+        log(f"quality gate -> probe.csv ({len(rows)} external rows)")
+
+
 # --------------------------------------------------------------------------- entry
 def run(cfg, force: bool = False):
     cfg.require("images.encoder", "text.encoder", "pooling.look_back_window_hours")
@@ -230,7 +356,5 @@ def run(cfg, force: bool = False):
     t0 = time.time()
     _embed_images(cfg, ckpt, force)
     _embed_notes(cfg, ckpt, force)
-    # §3 quality gate (image embeddings separate known labels on external CXR sets)
-    # is deferred: PadChest is present but CheXpert/ChestX-ray14 are not on disk yet.
-    log(f"extract_embeddings done in {time.time()-t0:,.0f}s "
-        f"(quality gate deferred until external CXR sets are available).")
+    _quality_gate(cfg, ckpt, force)   # §3: external CXR embedding-quality check
+    log(f"extract_embeddings done in {time.time()-t0:,.0f}s")
