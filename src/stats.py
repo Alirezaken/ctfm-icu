@@ -97,14 +97,47 @@ def _round1(x):
 
 
 # --------------------------------------------------------------------------- #
-#  Stubs -- implemented when the estimate stage lands                          #
+#  AIPW influence-function CI (§8 Kind B check) + E-values (§6.4 Kind C)       #
 # --------------------------------------------------------------------------- #
-def influence_function_ci(*args, **kwargs):
-    """AIPW influence-function 95% CI, reported as a check alongside the bootstrap
-    CI (§8 Kind B). TODO: implement with the cross-fitted AIPW estimator."""
-    raise NotImplementedError("influence_function_ci: implemented with the estimate stage")
+def influence_function_ci(psi, keep=None, ci: float = 95.0):
+    """Influence-function 95% CI, reported as a check alongside the bootstrap CI.
+    psi = per-patient AIPW influence values; effect = mean(psi)*100 pp,
+    SE = std(psi)/sqrt(n). Returns (point, lo, hi) in percentage points."""
+    p = np.asarray(psi, float)
+    if keep is not None:
+        p = p[np.asarray(keep, bool)]
+    p = p[np.isfinite(p)]
+    n = p.size
+    point = float(p.mean() * 100)
+    se = float(p.std(ddof=1) / np.sqrt(n) * 100)
+    z = 1.959963984540054 if ci == 95.0 else float(
+        __import__("scipy.stats", fromlist=["norm"]).norm.ppf(1 - (1 - ci / 100) / 2))
+    return _round1(point), _round1(point - z * se), _round1(point + z * se)
 
 
-def e_value(*args, **kwargs):
-    """E-value for an effect and for its CI limit (Kind C, §6.4). TODO."""
-    raise NotImplementedError("e_value: implemented with the controls analysis")
+def _rd_to_rr(rd_pp: float, baseline_pct: float):
+    """Approximate risk ratio from a risk difference (pp) given the comparator
+    baseline risk (percent), oriented >=1 (VanderWeele-Ding convention)."""
+    p0 = baseline_pct / 100.0
+    p1 = p0 + rd_pp / 100.0
+    if not (0 < p0 < 1) or not (0 < p1 < 1):
+        return None                      # effect implies an impossible risk -> E-value undefined
+    rr = p1 / p0
+    return rr if rr >= 1 else 1.0 / rr
+
+
+def e_value(rd_pp: float, baseline_pct: float):
+    """E-value for a risk-difference effect (Kind C, §6.4): minimum strength of
+    unmeasured confounding (risk-ratio scale) that could explain the effect away."""
+    rr = _rd_to_rr(rd_pp, baseline_pct)
+    if rr is None:
+        return None
+    return round(rr + np.sqrt(rr * (rr - 1)), 2)
+
+
+def e_value_ci_limit(ci_low_pp: float, ci_high_pp: float, baseline_pct: float):
+    """E-value for the CI limit nearest the null (RD=0); 1.0 if the CI crosses 0."""
+    if ci_low_pp <= 0 <= ci_high_pp:
+        return 1.0
+    bound = ci_low_pp if abs(ci_low_pp) < abs(ci_high_pp) else ci_high_pp
+    return e_value(bound, baseline_pct)

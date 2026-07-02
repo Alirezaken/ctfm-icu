@@ -1,0 +1,19 @@
+# config_variants.yaml -- ANALYST-OWNED fix variants (NOT Soroosh's config.yaml).
+#
+# The canonical run uses config.yaml exactly as specified (raw embeddings, §5) and
+# writes to results/. Each variant here changes ONLY how the embeddings enter the
+# estimator (to fix the positivity/overlap breakdown) and writes to its OWN results
+# directory, so nothing of Soroosh's is edited or overwritten. Selected with
+#   python main_causal.py --stage estimate --variant <name>
+#
+variants:
+  # Strong recommendation: compress each embedding modality (768-dim) into ONE
+  # cross-fitted propensity score (the sufficient balancing summary) -> best overlap.
+  pscore:
+    reduction: pscore
+    results_dir: results_pscore
+  # Alternative: unsupervised PCA to a few components per modality.
+  pca:
+    reduction: pca
+    pca_components: 30
+    results_dir: results_pca

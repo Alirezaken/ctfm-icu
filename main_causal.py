@@ -34,6 +34,9 @@ def _parse_args(argv=None):
     p.add_argument("--config", default=None, help="path to config.yaml (default: repo root)")
     p.add_argument("--intervention", default=None,
                    help="intervention key for per-intervention stages (default: fluids_sepsis)")
+    p.add_argument("--variant", default=None,
+                   help="embedding-fix variant from config_variants.yaml (e.g. pscore); "
+                        "writes to its own results dir, leaving config.yaml + results/ untouched")
     p.add_argument("--force", action="store_true", help="ignore checkpoints / recompute")
     p.add_argument("--list", action="store_true", help="list stages and exit")
     return p.parse_args(argv)
@@ -63,6 +66,16 @@ def main(argv=None):
     cfg = cfg_mod.load(args.config)
     log(f"config: {cfg.path}")
     log(f"storage_root: {cfg.storage_root}")
+
+    if args.variant:
+        import yaml
+        vpath = Path(__file__).resolve().parent / "config_variants.yaml"
+        vdefs = (yaml.safe_load(open(vpath)) or {}).get("variants", {})
+        if args.variant not in vdefs:
+            die(f"unknown variant '{args.variant}'. Known: {', '.join(vdefs)}")
+        v = vdefs[args.variant]
+        cfg.apply_variant(v["results_dir"], v["reduction"], v.get("pca_components", 30))
+        log(f"variant: {args.variant}  reduction={cfg.reduction}  results -> {v['results_dir']}/")
 
     if args.stage == "all":
         for s in stages.STAGES:

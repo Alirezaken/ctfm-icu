@@ -43,6 +43,17 @@ class Config:
     def __init__(self, data: dict, path: Path):
         self._d = data
         self.path = path
+        # variant overlay (analyst-owned; never edits config.yaml). Default = raw.
+        self.reduction = "none"        # embedding reduction: none|pscore|pca
+        self.pca_components = 30
+        self._results_override = None  # e.g. "results_pscore" for a fix variant
+
+    def apply_variant(self, results_dir: str, reduction: str, pca_components: int = 30):
+        """Overlay a fix variant: change how embeddings enter + where results go.
+        Leaves config.yaml (Soroosh's spec) and the canonical results/ untouched."""
+        self._results_override = results_dir
+        self.reduction = reduction
+        self.pca_components = pca_components
 
     def __getitem__(self, key):
         return self._d[key]
@@ -85,6 +96,8 @@ class Config:
         """Absolute path under storage_root for a named subdir, e.g.
         cfg.storage('results', 'effects.csv')."""
         sub = self.get(f"paths.{subkey}", subkey)
+        if subkey == "results" and self._results_override:
+            sub = self._results_override            # variant writes to its own dir
         return self.storage_root.joinpath(sub, *parts)
 
     def input(self, subkey: str) -> Path:

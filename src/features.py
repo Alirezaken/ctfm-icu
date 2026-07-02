@@ -56,6 +56,20 @@ def structured_at_t0(cfg, cohort) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def negative_control_uti(cfg, cohort) -> np.ndarray:
+    """Negative-control outcome `icu_acquired_uti` (§2): UTI diagnosis on the
+    cohort admission (ICD-9 599.0*, ICD-10 N39.0*). A treatment like fluid strategy
+    should not affect it, so a non-null effect here flags residual confounding.
+    (Proxy: coded UTI on the hadm; documented operationalization.)"""
+    dx = pd.read_csv(cfg.input("mimic_dir") / "hosp" / "diagnoses_icd.csv.gz",
+                     usecols=["hadm_id", "icd_code", "icd_version"])
+    code = dx["icd_code"].astype(str).str.upper().str.replace(".", "", regex=False)
+    is_uti = (((dx["icd_version"] == 9) & code.str.startswith("5990")) |
+              ((dx["icd_version"] == 10) & code.str.startswith("N390")))
+    uti_hadm = set(dx.loc[is_uti, "hadm_id"])
+    return cohort["hadm_id"].isin(uti_hadm).astype(int).to_numpy()
+
+
 def pool_embeddings(cfg, cohort, modality, variant=None) -> np.ndarray:
     """Mean-pool pre-t0 vectors within look-back into one proxy per patient.
 

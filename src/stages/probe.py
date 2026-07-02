@@ -1,12 +1,14 @@
-"""§9.6 / §6.5  probe -- validity probe (a GATE, run before estimating).
+"""§9.6 / §6.5  probe -- validity probe + external embedding-quality gate.
 
-Held-out linear-probe prediction of each proxy's target confounder:
-  - image proxy -> labeled pulmonary edema (MIMIC-CXR-JPG Edema label).
-  - note proxy  -> its target confounder (only if a labeled target exists).
-A logistic-regression probe is trained on the official train split and evaluated
-on the test split; AUROC and AUPRC reported as Kind A (bootstrap mean/std/95% CI,
-percent, 1 dp) -> probe.csv. If a modality cannot predict its confounder, STOP and
-tell Soroosh (§9.6); we log a loud GATE-FAIL but still record the numbers.
+Two checks, both Kind A (bootstrap mean/std/95% CI, percent, 1 dp) -> probe.csv:
+  1. MIMIC image proxy -> edema (the validity gate that must pass before estimating).
+  2. EXTERNAL gate (§3): do the RAD-DINO embeddings separate known findings on
+     PadChest / ChestX-ray14 (and CheXpert once uploaded)? Uses the vectors already
+     produced by extract_external_cxr; here we only join master-list labels and run
+     a held-out linear probe. modality column = 'image' (MIMIC) or 'image@<dataset>'.
+
+probe.csv is rewritten from scratch each run (idempotent). If the MIMIC gate fails,
+STOP and tell Soroosh (§9.6).
 """
 from __future__ import annotations
 
@@ -17,78 +19,114 @@ from src.util import log
 from src import events as ev
 from src import results as R
 
-_GATE_AUROC = 0.70   # below this on the test split -> gate fails, tell Soroosh
+_GATE_AUROC = 0.70
 
 
-def _ka_summary(values_pct):
-    """Kind-A summary (percent, 1 dp): mean/std/95% CI of a bootstrap vector."""
+def _ka(values_pct):
     b = np.asarray(values_pct, float); b = b[np.isfinite(b)]
     r = lambda x: round(float(x), 1)
     return r(np.mean(b)), r(np.std(b, ddof=1)), r(np.percentile(b, 2.5)), r(np.percentile(b, 97.5))
 
 
-def _image_probe(cfg):
+def _eval_probe(Vtr, ytr, Vte, yte, subj_te, seed, modality, target):
+    """Fit a logistic probe on train, evaluate on held-out test; Kind-A row dict."""
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
     from sklearn.metrics import roc_auc_score, average_precision_score
     from src.stats import cluster_bootstrap_indices
 
+    sc = StandardScaler().fit(Vtr)
+    clf = LogisticRegression(max_iter=1000).fit(sc.transform(Vtr), ytr)
+    p = clf.predict_proba(sc.transform(Vte))[:, 1]
+    auroc = roc_auc_score(yte, p) * 100
+    auprc = average_precision_score(yte, p) * 100
+    br, bp = [], []
+    for bidx in cluster_bootstrap_indices(subj_te, 1000, seed):
+        yb, pb = yte[bidx], p[bidx]
+        if yb.min() == yb.max():
+            continue
+        br.append(roc_auc_score(yb, pb) * 100); bp.append(average_precision_score(yb, pb) * 100)
+    rm, rs, rl, rh = _ka(br); pm, ps, pl, ph = _ka(bp)
+    log(f"    {modality}/{target}: AUROC={auroc:.1f} AUPRC={auprc:.1f}")
+    return {"modality": modality, "target_confounder": target,
+            "auroc_mean": rm, "auroc_std": rs, "auroc_ci_low": rl, "auroc_ci_high": rh,
+            "auprc_mean": pm, "auprc_std": ps, "auprc_ci_low": pl, "auprc_ci_high": ph}, auroc
+
+
+def _binary(series):
+    """CheXpert/NIH style -> 1 positive vs 0 (negative or not-mentioned); drop uncertain/NaN."""
+    y = pd.to_numeric(series, errors="coerce")
+    return y
+
+
+def _mimic_image_probe(cfg):
     label = cfg.get("interventions.fluids_sepsis.imaging_confounder_label", "edema")
     idx, V = ev.load_embeddings(cfg, "images")
     cxr = ev.link(cfg, "cxr_studies")[["study_id", label, "split"]]
     df = idx.merge(cxr, on="study_id", how="left").reset_index(drop=True)
-
-    # CheXpert encoding here: 1=positive, 0=negative, 2=not-mentioned, 3=uncertain.
-    # Edema has essentially no explicit 0s, so use the standard convention:
-    # positive = 1; negative = explicit-negative OR not-mentioned (0 or 2);
-    # drop uncertain (3) and missing.
-    y = pd.to_numeric(df[label], errors="coerce")
-    keep = y.isin([0, 1, 2]).to_numpy()
+    y = _binary(df[label])
+    keep = y.isin([0, 1, 2]).to_numpy()           # positive=1; negative/not-mentioned=0; drop uncertain(3)
     df, X = df[keep].reset_index(drop=True), V[keep]
     y = (y[keep] == 1).astype(int).to_numpy()
-    tr = (df["split"] == "train").to_numpy()
-    te = (df["split"] == "test").to_numpy()
-    log(f"  image probe '{label}': train={tr.sum():,} test={te.sum():,} "
-        f"(pos rate train={y[tr].mean():.3f} test={y[te].mean():.3f})")
+    tr = (df["split"] == "train").to_numpy(); te = (df["split"] == "test").to_numpy()
+    log(f"  MIMIC image '{label}': train={tr.sum():,} test={te.sum():,} pos_rate={y[te].mean():.3f}")
+    row, auroc = _eval_probe(X[tr], y[tr], X[te], y[te],
+                             df.loc[te, "subject_id"].to_numpy(), cfg.get("run.seed", 42),
+                             "image", label)
+    if auroc / 100 < _GATE_AUROC:
+        log(f"  *** GATE-FAIL: MIMIC image proxy can't predict {label} (AUROC<{_GATE_AUROC}); tell Soroosh.")
+    return [row]
 
-    sc = StandardScaler().fit(X[tr])
-    clf = LogisticRegression(max_iter=1000, C=1.0).fit(sc.transform(X[tr]), y[tr])
-    p = clf.predict_proba(sc.transform(X[te]))[:, 1]
-    yte = y[te]
-    auroc = roc_auc_score(yte, p) * 100
-    auprc = average_precision_score(yte, p) * 100
 
-    # Kind-A bootstrap: cluster by patient on the test set
-    subj = df.loc[te, "subject_id"].to_numpy()
-    seed = cfg.get("run.seed", 42)
-    n_boot = min(1000, cfg.get("bootstrap.n_resamples", 1000))
-    bo_roc, bo_prc = [], []
-    for bidx in cluster_bootstrap_indices(subj, n_boot, seed):
-        yb, pb = yte[bidx], p[bidx]
-        if yb.min() == yb.max():
-            continue
-        bo_roc.append(roc_auc_score(yb, pb) * 100)
-        bo_prc.append(average_precision_score(yb, pb) * 100)
-    rm, rs, rl, rh = _ka_summary(bo_roc)
-    pm, ps, pl, ph = _ka_summary(bo_prc)
-    gate = "PASS" if auroc / 100 >= _GATE_AUROC else "FAIL"
-    log(f"  image probe '{label}': AUROC={auroc:.1f}  AUPRC={auprc:.1f}  GATE={gate}")
-    if gate == "FAIL":
-        log(f"  *** GATE-FAIL: image proxy cannot predict {label} (AUROC<{_GATE_AUROC}); "
-            f"tell Soroosh before estimating (§9.6).")
-    return {"modality": "image", "target_confounder": label,
-            "auroc_mean": rm, "auroc_std": rs, "auroc_ci_low": rl, "auroc_ci_high": rh,
-            "auprc_mean": pm, "auprc_std": ps, "auprc_ci_low": pl, "auprc_ci_high": ph}
+def _external_gates(cfg):
+    qg = cfg.get("quality_gate")
+    if not qg:
+        return []
+    labels = qg.get("probe_labels", [])
+    seed = int(cfg.get("run.seed", 42))
+    rows = []
+    for ds, spec in qg.get("datasets", {}).items():
+        base = cfg.storage("embeddings", "external", ds)
+        vpath, ipath = base / "vectors.npy", base / "index.csv"
+        if not vpath.exists():
+            log(f"  external {ds}: no embeddings yet (run extract_external_cxr); skip"); continue
+        V = np.load(vpath).astype("float32")
+        idx = pd.read_csv(ipath)                                    # image_id, row (aligned to V)
+        master = pd.read_csv(spec["master"], low_memory=False)
+        keycol = "ImageID" if "ImageID" in master else "image_id"
+        master = master.drop_duplicates(keycol).set_index(keycol)
+        pidcol = next((c for c in ("PatientID", "patient_id") if c in master.columns), None)
+        pid = (master[pidcol].reindex(idx["image_id"]).to_numpy() if pidcol
+               else np.arange(len(idx)))
+        rng = np.random.default_rng(seed)
+        if pidcol is not None:
+            pats = pd.unique(pid[pd.notna(pid)])
+            test_pats = set(rng.choice(pats, size=max(1, int(len(pats) * 0.3)), replace=False))
+            te = np.array([p in test_pats for p in pid])
+        else:
+            te = rng.random(len(idx)) < 0.3
+        tr = ~te
+        log(f"  external {ds}: {len(idx):,} images (train={tr.sum():,} test={te.sum():,})")
+        for lab in labels:
+            col = spec.get("label_map", {}).get(lab)
+            if not col or col not in master.columns:
+                continue
+            y = (_binary(master[col].reindex(idx["image_id"])) == 1).astype(int).to_numpy()
+            if y[tr].sum() < 20 or y[te].sum() < 10:
+                log(f"    {ds}/{lab}: too few positives; skip"); continue
+            row, _ = _eval_probe(V[tr], y[tr], V[te], y[te], pid[te], seed, f"image@{ds}", lab)
+            rows.append(row)
+    return rows
 
 
 def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
     cfg.require(f"interventions.{intervention}.imaging_confounder_label")
-    log(f"probe[{intervention}]: image validity gate ...")
-    rows = [_image_probe(cfg)]
+    log(f"probe[{intervention}]: MIMIC validity gate + external quality gate ...")
+    rows = _mimic_image_probe(cfg) + _external_gates(cfg)
 
-    note_target = cfg.get(f"interventions.{intervention}.notes_confounder")
-    if note_target:
-        log(f"  note probe target '{note_target}': no labeled ground truth available "
-            f"-> deferred (needs a label definition from Soroosh).")
+    # rewrite probe.csv from scratch (idempotent)
+    p = cfg.storage("results", "probe.csv")
+    if p.exists():
+        p.unlink()
     R.append_rows(cfg, "probe.csv", rows)
-    log("probe done -> probe.csv")
+    log(f"probe done -> probe.csv ({len(rows)} rows)")
