@@ -34,6 +34,7 @@ SCHEMAS: dict[str, list[str]] = {
     "effects.csv": (
         ["intervention", "condition", "cohort", "dataset", "method"]
         + _kb("effect")
+        + ["effect_if_ci_low", "effect_if_ci_high"]   # §8 influence-function CI, a check
         + ["ref_rd", "ref_ci_low", "ref_ci_high"]
         + _kb("bias")
         + ["inside_reference_ci"]

@@ -37,7 +37,7 @@ def crossfit_aipw(X, A, Y, folds, seed, trim=0.01):
     ess = (w[keep].sum() ** 2) / np.sum(w[keep] ** 2)
     diag = {"e_min": float(e.min()), "e_max": float(e.max()),
             "frac_trimmed": float((~keep).mean()), "ess": float(ess),
-            "n": int(keep.sum())}
+            "n": int(keep.sum()), "e": e}          # propensity, for §7.6 balance/weighting
     return psi, keep, diag
 
 

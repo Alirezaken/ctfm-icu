@@ -20,7 +20,8 @@ import pandas as pd
 from src.util import log
 from src import features, aipw, reduce, results as R
 from src.stats import (cluster_bootstrap_indices, bootstrap_summary,
-                       e_value, e_value_ci_limit)
+                       e_value, e_value_ci_limit, influence_function_ci,
+                       minimum_detectable_effect, standardized_mean_differences)
 
 
 def _reset(cfg, fname, intervention, section=None):
@@ -33,7 +34,8 @@ def _reset(cfg, fname, intervention, section=None):
     if "intervention" in df.columns:
         m = df["intervention"] == intervention
         if section and "section" in df.columns:
-            m = m & (df["section"] == section)
+            secs = [section] if isinstance(section, str) else list(section)
+            m = m & (df["section"].isin(secs))
         df[~m].to_csv(p, index=False)
 
 
@@ -60,7 +62,8 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
     folds = int(cfg.get("estimator.cross_fitting_folds", 5))
 
     # ---- features (all strictly pre-t0) ----
-    S = features.structured_at_t0(cfg, cohort).to_numpy(dtype=float)
+    Sframe = features.structured_at_t0(cfg, cohort)
+    S = Sframe.to_numpy(dtype=float)
     Ximg = features.pool_embeddings(cfg, cohort, "images")
     Xnote = features.pool_embeddings(cfg, cohort, "notes", "notes_all")
     # fix-variant only: compress embeddings so they don't break propensity overlap
@@ -90,13 +93,16 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
 
     eff_rows, coh_rows, ctrl_rows = [], [], []
     boot_by_cond, point_by_cond = {}, {}
+    psi_by_cond, keep_by_cond, e_by_cond = {}, {}, {}
     for name, X in conditions.items():
         psi, keep, diag = aipw.crossfit_aipw(X, A, Y, folds, seed)
         point = float(psi[keep].mean() * 100)
         bvals = [psi[b][keep[b]].mean() * 100 for b in boot]
         boot_by_cond[name] = np.asarray(bvals, dtype=float)
         point_by_cond[name] = point
+        psi_by_cond[name] = psi; keep_by_cond[name] = keep; e_by_cond[name] = diag["e"]
         eff = bootstrap_summary(point, bvals)
+        _, if_lo, if_hi = influence_function_ci(psi, keep)      # §8 IF CI, a check
         bias = bootstrap_summary(point - ref_rd, [v - ref_rd for v in bvals])
         inside = bool(ref_lo <= point <= ref_hi)
 
@@ -115,6 +121,7 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
             "intervention": intervention, "condition": name, "cohort": "all_modality",
             "dataset": "mimic", "method": "aipw" if name != "naive" else "unadjusted",
             **eff.as_row("effect_"),
+            "effect_if_ci_low": if_lo, "effect_if_ci_high": if_hi,
             "ref_rd": ref_rd, "ref_ci_low": ref_lo, "ref_ci_high": ref_hi,
             **bias.as_row("bias_"), "inside_reference_ci": inside,
             "ci_width": round(eff.ci_high - eff.ci_low, 1),
@@ -130,6 +137,41 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
                              "value": val, "support_count": diag["n"]})
         log(f"  {name:18s} RD={point:6.1f} pp  CI[{eff.ci_low:.1f},{eff.ci_high:.1f}]  "
             f"bias={point-ref_rd:+.1f}  inside_ref_CI={inside}  ESS={round(diag['ess'])}")
+
+    # ---- §2/§6 minimum detectable effect (null interventions) ----
+    if cfg.get(f"interventions.{intervention}.rct_reference.target_type") in (None, "null"):
+        mde = minimum_detectable_effect(psi_by_cond["structured"], keep_by_cond["structured"])
+        if mde is not None:
+            coh_rows.append({"intervention": intervention, "section": "mde",
+                             "metric": "min_detectable_rd_pp__structured", "stratum": "",
+                             "arm": "", "value": mde, "support_count": int(keep_by_cond["structured"].sum())})
+            log(f"  minimum detectable RD (structured, 80% power): {mde:.2f} pp")
+
+    # ---- §7.6 covariate balance before/after weighting (structured set) ----
+    e_s = np.clip(e_by_cond["structured"], 1e-6, 1 - 1e-6)
+    w_ipw = np.where(A == 1, 1.0 / e_s, 1.0 / (1.0 - e_s))
+    smd_before = standardized_mean_differences(S, A)
+    smd_after = standardized_mean_differences(S, A, weights=w_ipw)
+    for j, col in enumerate(Sframe.columns):
+        for tag, arr in [("smd_before", smd_before), ("smd_after", smd_after)]:
+            v = arr[j]
+            coh_rows.append({"intervention": intervention, "section": "balance",
+                             "metric": f"{tag}__{col}", "stratum": "", "arm": "",
+                             "value": round(float(v), 3) if np.isfinite(v) else "",
+                             "support_count": len(A)})
+
+    # ---- §6.6 missingness: imaged (all-modality) vs non-imaged eligible patients ----
+    nonimg = full[~full["all_modality"]].reset_index(drop=True)
+    for stratum, grp in [("imaged", cohort), ("non_imaged", nonimg)]:
+        if not len(grp):
+            continue
+        for metric, val in [("age_mean", round(float(grp["age_t0"].mean()), 1)),
+                            ("sex_male_frac", round(float((grp["sex"] == "M").mean()), 3)),
+                            ("mortality_frac", round(float(grp["outcome"].mean()), 3)),
+                            ("active_arm_frac", round(float((grp["arm"] == "active").mean()), 3))]:
+            coh_rows.append({"intervention": intervention, "section": "missingness",
+                             "metric": metric, "stratum": stratum, "arm": "",
+                             "value": val, "support_count": int(len(grp))})
 
     # notes_clinical (discharge-only) sensitivity conditions for the decomposition
     # (§6.3, decision 2). Saved to the boot file only; not primary effect rows.
@@ -171,16 +213,24 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
             pt = float(psi[keep].mean() * 100)
             bt = [psi[b][keep[b]].mean() * 100 for b in sboot]
             e = bootstrap_summary(pt, bt)
+            _, sif_lo, sif_hi = influence_function_ci(psi, keep)
             bi = bootstrap_summary(pt - ref_rd, [v - ref_rd for v in bt])
             eff_rows.append({
                 "intervention": intervention, "condition": name, "cohort": scope,
                 "dataset": "mimic", "method": "aipw" if name != "naive" else "unadjusted",
-                **e.as_row("effect_"), "ref_rd": ref_rd, "ref_ci_low": ref_lo, "ref_ci_high": ref_hi,
+                **e.as_row("effect_"), "effect_if_ci_low": sif_lo, "effect_if_ci_high": sif_hi,
+                "ref_rd": ref_rd, "ref_ci_low": ref_lo, "ref_ci_high": ref_hi,
                 **bi.as_row("bias_"), "inside_reference_ci": bool(ref_lo <= pt <= ref_hi),
                 "ci_width": round(e.ci_high - e.ci_low, 1), "effective_sample_size": round(diag["ess"])})
             coh_rows.append({"intervention": intervention, "section": "overlap_ess",
                              "metric": f"ess__{name}@{scope}", "stratum": "", "arm": "",
                              "value": round(diag["ess"]), "support_count": diag["n"]})
+            # §6.6 imaged-subset sensitivity: does restricting to imaged shift `structured`?
+            if name == "structured":
+                shift = round(pt - point_by_cond["structured"], 1)
+                coh_rows.append({"intervention": intervention, "section": "missingness",
+                                 "metric": f"structured_shift_imaged_minus_{scope}", "stratum": "",
+                                 "arm": "", "value": shift, "support_count": len(sub)})
             log(f"    {scope}/{name}: RD={pt:.1f} ESS={round(diag['ess'])}")
 
     # persist per-condition bootstrap replicates (paired; needed by consolidate for
@@ -193,7 +243,8 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
 
     _reset(cfg, "effects.csv", intervention)
     _reset(cfg, "controls.csv", intervention)
-    _reset(cfg, "cohorts.csv", intervention, section="overlap_ess")
+    _reset(cfg, "cohorts.csv", intervention,
+           section=["overlap_ess", "mde", "balance", "missingness"])
     R.append_rows(cfg, "effects.csv", eff_rows)
     R.append_rows(cfg, "controls.csv", ctrl_rows)
     R.append_rows(cfg, "cohorts.csv", coh_rows)

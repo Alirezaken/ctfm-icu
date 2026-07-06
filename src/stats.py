@@ -115,6 +115,47 @@ def influence_function_ci(psi, keep=None, ci: float = 95.0):
     return _round1(point), _round1(point - z * se), _round1(point + z * se)
 
 
+def minimum_detectable_effect(psi, keep=None, power: float = 0.80, alpha: float = 0.05):
+    """Minimum detectable risk difference (pp) for a null intervention (§2/§6): the
+    smallest true effect this cohort could detect at the given power, from the
+    estimator's realized standard error. MDE = (z_{1-alpha/2} + z_{power}) * SE,
+    SE = std(psi[keep])/sqrt(n) * 100. Uses the actual AIPW influence values, so it
+    reflects the true precision after weighting/overlap, not a nominal N."""
+    from scipy.stats import norm
+    p = np.asarray(psi, float)
+    if keep is not None:
+        p = p[np.asarray(keep, bool)]
+    p = p[np.isfinite(p)]
+    n = p.size
+    if n < 2:
+        return None
+    se = float(p.std(ddof=1) / np.sqrt(n) * 100)
+    z = norm.ppf(1 - alpha / 2) + norm.ppf(power)
+    return round(z * se, 2)
+
+
+def standardized_mean_differences(X, A, weights=None):
+    """Per-column standardized mean difference between arms (§7.6 covariate balance),
+    before weighting (weights=None) or after IPW weighting. SMD = (m1 - m0) / s_pool,
+    s_pool from the *unweighted* arm variances so before/after share a scale."""
+    X = np.asarray(X, float); A = np.asarray(A, int)
+    t, c = A == 1, A == 0
+    sp = np.sqrt((np.nanvar(X[t], axis=0, ddof=1) + np.nanvar(X[c], axis=0, ddof=1)) / 2)
+    sp = np.where(sp > 0, sp, np.nan)
+    if weights is None:
+        m1 = np.nanmean(X[t], axis=0); m0 = np.nanmean(X[c], axis=0)
+    else:
+        w = np.asarray(weights, float)
+        def wm(mask):
+            xm = X[mask]; wm_ = w[mask]
+            ok = ~np.isnan(xm)
+            num = np.nansum(np.where(ok, xm * wm_[:, None], 0.0), axis=0)
+            den = np.sum(np.where(ok, wm_[:, None], 0.0), axis=0)
+            return num / np.where(den > 0, den, np.nan)
+        m1 = wm(t); m0 = wm(c)
+    return (m1 - m0) / sp
+
+
 def _rd_to_rr(rd_pp: float, baseline_pct: float):
     """Approximate risk ratio from a risk difference (pp) given the comparator
     baseline risk (percent), oriented >=1 (VanderWeele-Ding convention)."""

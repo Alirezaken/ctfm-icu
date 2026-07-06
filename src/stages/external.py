@@ -34,7 +34,7 @@ import pandas as pd
 
 from src.util import log, die
 from src import aipw, results as R
-from src.stats import cluster_bootstrap_indices, bootstrap_summary
+from src.stats import cluster_bootstrap_indices, bootstrap_summary, influence_function_ci
 
 # APACHE first-day physiology used as the structured set (no treatment-derived
 # fields: intubated/vent/dialysis/meds/urine/GCS-components are excluded).
@@ -232,6 +232,7 @@ def _one(cfg, intervention, spine, aps, seed, folds, nboot):
     boot = list(cluster_bootstrap_indices(coh["uniquepid"].to_numpy(), nboot, seed))
     bvals = [psi[b][keep[b]].mean() * 100 for b in boot]
     eff = bootstrap_summary(point, bvals)
+    _, if_lo, if_hi = influence_function_ci(psi, keep)
     bias = bootstrap_summary(point - ref_rd, [v - ref_rd for v in bvals])
     log(f"  {intervention}: eICU n={len(coh)} active={A.sum()} deaths={Y.sum()} "
         f"RD={point:.1f} [{eff.ci_low:.1f},{eff.ci_high:.1f}] ESS={round(diag['ess'])} "
@@ -239,7 +240,8 @@ def _one(cfg, intervention, spine, aps, seed, folds, nboot):
     return {
         "intervention": intervention, "condition": "structured", "cohort": "eicu_all",
         "dataset": "eicu", "method": "aipw",
-        **eff.as_row("effect_"), "ref_rd": ref_rd, "ref_ci_low": ref_lo, "ref_ci_high": ref_hi,
+        **eff.as_row("effect_"), "effect_if_ci_low": if_lo, "effect_if_ci_high": if_hi,
+        "ref_rd": ref_rd, "ref_ci_low": ref_lo, "ref_ci_high": ref_hi,
         **bias.as_row("bias_"), "inside_reference_ci": bool(ref_lo <= point <= ref_hi),
         "negative_control_point": "", "negative_control_mean": "", "negative_control_std": "",
         "negative_control_ci_low": "", "negative_control_ci_high": "",
