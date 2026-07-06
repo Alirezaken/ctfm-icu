@@ -3,20 +3,39 @@
 Raw embeddings (768-dim/modality) as AIPW covariates destroy propensity overlap on
 the small causal cohort. These reductions compress each modality before it enters
 the estimator, restoring overlap while keeping the causal signal. Applied only in
-fix-variant runs; the canonical run (config.yaml, §5) uses raw embeddings.
+fix-variant runs; the canonical run (config.yaml, §5) uses raw embeddings (kept as a
+documented failure case).
 """
 from __future__ import annotations
 
 import numpy as np
 
+_LGBM = dict(n_estimators=300, learning_rate=0.05, num_leaves=15,
+             min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
+             reg_lambda=1.0, verbosity=-1, n_jobs=4)
 
-def apply(X, method: str, A=None, folds: int = 5, seed: int = 42, k: int = 30):
+
+def _crossfit_proba(X, target, folds, seed):
+    """Out-of-fold P(target=1 | X) via LightGBM (cross-fitted, no leakage)."""
+    from sklearn.model_selection import KFold
+    from lightgbm import LGBMClassifier
+    target = np.asarray(target, int)
+    s = np.zeros(len(target))
+    for tr, te in KFold(folds, shuffle=True, random_state=seed).split(X):
+        s[te] = LGBMClassifier(**_LGBM).fit(X[tr], target[tr]).predict_proba(X[te])[:, 1]
+    return s
+
+
+def apply(X, method: str, A=None, Y=None, folds: int = 5, seed: int = 42, k: int = 30):
     """Reduce a per-patient embedding matrix X (n x d) for one modality.
 
-    - 'pscore': cross-fitted P(A=1 | X) -> one column (the sufficient balancing
-      summary of the embedding for confounding). Best overlap by construction.
-    - 'pca'   : unsupervised PCA to k components.
-    - 'none'  : unchanged (raw).
+    - 'score' : Soroosh's approved fix -- TWO cross-fitted low-dim scores per
+      modality: a propensity score P(A=1|X) and a separate prognostic score
+      P(Y=1|X). Adjusting for both restores overlap and avoids the circularity of
+      reusing a treatment-only score in the outcome model.
+    - 'pscore': single cross-fitted propensity score P(A=1|X) (earlier variant).
+    - 'pca'   : unsupervised PCA to k components (reported as a sensitivity).
+    - 'none'  : unchanged (raw; documented failure case).
     """
     X = np.asarray(X, dtype=float)
     if method == "none" or X.shape[1] <= 1:
@@ -27,17 +46,13 @@ def apply(X, method: str, A=None, folds: int = 5, seed: int = 42, k: int = 30):
         Xs = StandardScaler().fit_transform(X)
         return PCA(n_components=min(k, Xs.shape[1]), random_state=seed).fit_transform(Xs)
     if method == "pscore":
-        from sklearn.model_selection import KFold
-        from lightgbm import LGBMClassifier
         if A is None:
             raise ValueError("pscore reduction needs the treatment vector A")
-        A = np.asarray(A, int)
-        n = len(A)
-        s = np.zeros(n)
-        params = dict(n_estimators=300, learning_rate=0.05, num_leaves=15,
-                      min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
-                      reg_lambda=1.0, verbosity=-1, n_jobs=4)
-        for tr, te in KFold(folds, shuffle=True, random_state=seed).split(X):
-            s[te] = LGBMClassifier(**params).fit(X[tr], A[tr]).predict_proba(X[te])[:, 1]
-        return s.reshape(-1, 1)
+        return _crossfit_proba(X, A, folds, seed).reshape(-1, 1)
+    if method == "score":
+        if A is None or Y is None:
+            raise ValueError("score reduction needs both A (treatment) and Y (outcome)")
+        ps = _crossfit_proba(X, A, folds, seed)     # propensity score
+        pg = _crossfit_proba(X, Y, folds, seed)     # prognostic score
+        return np.column_stack([ps, pg])
     raise ValueError(f"unknown reduction method '{method}'")

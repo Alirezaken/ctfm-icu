@@ -79,15 +79,19 @@ def run(cfg, force: bool = False):
                          "test": "cluster_bootstrap", "statistic": round(red_pt, 3),
                          "p_raw": _p_two_sided(red_bt), "p_fdr": None})
 
-        # --- decomposition: marginal + complementary, notes & imaging (clinical) ---
-        if {"plus_notes", "plus_imaging_only", "full"} <= set(bt):
-            for mod, own, other in [("notes", "plus_notes", "plus_imaging_only"),
-                                    ("imaging", "plus_imaging_only", "plus_notes")]:
+        # --- decomposition: marginal + complementary, notes & imaging, BOTH note
+        #     variants (§6.3): 'all' (radiology-inclusive, primary) and 'clinical'.
+        for variant, pn, fu in [("all", "plus_notes", "full"),
+                                ("clinical", "plus_notes_clinical", "full_clinical")]:
+            if not ({pn, "plus_imaging_only", fu} <= set(bt)):
+                continue
+            for mod, own, other in [("notes", pn, "plus_imaging_only"),
+                                    ("imaging", "plus_imaging_only", pn)]:
                 marg_pt = bias0_pt - abs(pt[own] - ref)
                 marg_bt = bias0_bt - _absbias(bt[own], ref)
-                comp_pt = abs(pt[other] - ref) - abs(pt["full"] - ref)   # added on top of the other
-                comp_bt = _absbias(bt[other], ref) - _absbias(bt["full"], ref)
-                decomp.append({"intervention": iv, "modality": mod, "notes_variant": "clinical",
+                comp_pt = abs(pt[other] - ref) - abs(pt[fu] - ref)   # added on top of the other
+                comp_bt = _absbias(bt[other], ref) - _absbias(bt[fu], ref)
+                decomp.append({"intervention": iv, "modality": mod, "notes_variant": variant,
                                **bootstrap_summary(marg_pt, marg_bt).as_row("marginal_bias_reduction_"),
                                **bootstrap_summary(comp_pt, comp_bt).as_row("complementary_bias_reduction_")})
 

@@ -43,10 +43,10 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
 
     S = features.structured_at_t0(cfg, cohort).to_numpy(dtype=float)
     Ximg = features.pool_embeddings(cfg, cohort, "images")
-    Xnote = features.pool_embeddings(cfg, cohort, "notes", "notes_clinical")
+    Xnote = features.pool_embeddings(cfg, cohort, "notes", "notes_all")
     if cfg.reduction != "none":
-        Ximg = reduce.apply(Ximg, cfg.reduction, A, folds, seed, cfg.pca_components)
-        Xnote = reduce.apply(Xnote, cfg.reduction, A, folds, seed, cfg.pca_components)
+        Ximg = reduce.apply(Ximg, cfg.reduction, A, Y, folds, seed, cfg.pca_components)
+        Xnote = reduce.apply(Xnote, cfg.reduction, A, Y, folds, seed, cfg.pca_components)
     conds = {"naive": np.ones((len(Y), 1)), "structured": S,
              "full": np.hstack([S, Xnote, Ximg])}
 

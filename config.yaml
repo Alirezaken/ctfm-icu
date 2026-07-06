@@ -34,7 +34,12 @@ paths:
       id_col:      image_id
       view_col:    view_position
       path:        "{images_root}/{img_rel_path}"
-    chexpert: null    # upload pending; add {csv, images_root, id_col, view_col, path} then re-run
+    chexpert:
+      csv:         ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/chexpert_gate_master.csv
+      images_root: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/preprocessed_chxpert
+      id_col:      image_id
+      view_col:    AP_PA                     # 'view' is Frontal/Lateral; AP_PA passes _is_frontal
+      path:        "{images_root}/{img_path}"
 
   # storage subdirectories (created under storage_root)
   embeddings:  embeddings
@@ -89,6 +94,10 @@ estimator:
   method: aipw                         # cross-fitted AIPW everywhere
   nuisance_model: lightgbm
   cross_fitting_folds: 5
+  # decision 4 (Soroosh-approved): reduce each embedding modality to a cross-fitted
+  # propensity score + prognostic score before it enters the nuisance models.
+  # 'raw' (failure case) and 'pca' (sensitivity) are run as --variant overrides.
+  embedding_reduction: score
 
 conditions: [naive, structured, plus_notes, plus_imaging_only, full, design_based]
 
@@ -240,3 +249,8 @@ quality_gate:
       path_col: img_rel_path                  # abs path = images/img_rel_path
       view_col: view_position
       label_map: {edema: edema, effusion: effusion, cardiomegaly: cardiomegaly}
+    chexpert:
+      images: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/preprocessed_chxpert
+      master: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/chexpert_gate_master.csv
+      view_col: AP_PA                         # keycol=image_id, pidcol=patient_id (present in prepared master)
+      label_map: {edema: edema, effusion: pleural_effusion, cardiomegaly: cardiomegaly}

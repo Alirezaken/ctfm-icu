@@ -62,11 +62,11 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
     # ---- features (all strictly pre-t0) ----
     S = features.structured_at_t0(cfg, cohort).to_numpy(dtype=float)
     Ximg = features.pool_embeddings(cfg, cohort, "images")
-    Xnote = features.pool_embeddings(cfg, cohort, "notes", "notes_clinical")
+    Xnote = features.pool_embeddings(cfg, cohort, "notes", "notes_all")
     # fix-variant only: compress embeddings so they don't break propensity overlap
     if cfg.reduction != "none":
-        Ximg = reduce.apply(Ximg, cfg.reduction, A, folds, seed, cfg.pca_components)
-        Xnote = reduce.apply(Xnote, cfg.reduction, A, folds, seed, cfg.pca_components)
+        Ximg = reduce.apply(Ximg, cfg.reduction, A, Y, folds, seed, cfg.pca_components)
+        Xnote = reduce.apply(Xnote, cfg.reduction, A, Y, folds, seed, cfg.pca_components)
         log(f"  embedding reduction '{cfg.reduction}': "
             f"image->{Ximg.shape[1]}d, notes->{Xnote.shape[1]}d")
     conditions = {
@@ -76,6 +76,10 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
         "plus_imaging_only": np.hstack([S, Ximg]),
         "full": np.hstack([S, Xnote, Ximg]),
     }
+    # design_based (§5): expert-curated confounder set (no embeddings)
+    exp_names = cfg.get(f"interventions.{intervention}.expert_confounders") or []
+    if exp_names:
+        conditions["design_based"] = features.expert_features(cfg, cohort, exp_names).to_numpy(dtype=float)
 
     # ---- shared bootstrap indices (patient-level, reused across conditions) ----
     nboot = int(cfg.get("bootstrap.n_resamples", 10000))
@@ -127,6 +131,17 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
         log(f"  {name:18s} RD={point:6.1f} pp  CI[{eff.ci_low:.1f},{eff.ci_high:.1f}]  "
             f"bias={point-ref_rd:+.1f}  inside_ref_CI={inside}  ESS={round(diag['ess'])}")
 
+    # notes_clinical (discharge-only) sensitivity conditions for the decomposition
+    # (§6.3, decision 2). Saved to the boot file only; not primary effect rows.
+    Xnote_c = features.pool_embeddings(cfg, cohort, "notes", "notes_clinical")
+    if cfg.reduction != "none":
+        Xnote_c = reduce.apply(Xnote_c, cfg.reduction, A, Y, folds, seed, cfg.pca_components)
+    for cname, Xc in [("plus_notes_clinical", np.hstack([S, Xnote_c])),
+                      ("full_clinical", np.hstack([S, Xnote_c, Ximg]))]:
+        cpsi, ckeep, _ = aipw.crossfit_aipw(Xc, A, Y, folds, seed)
+        boot_by_cond[cname] = np.asarray([cpsi[b][ckeep[b]].mean() * 100 for b in boot])
+        point_by_cond[cname] = float(cpsi[ckeep].mean() * 100)
+
     # ---- B (§1): additionally report structured/notes on the LARGER cohort ----
     # "You may additionally report the structured and notes conditions on the larger
     # cohort, flagged as such" (§1). Flagged via the `cohort` column; imaging/full
@@ -145,9 +160,9 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
         sS = features.structured_at_t0(cfg, sub).to_numpy(dtype=float)
         scond = {"naive": np.ones((len(sY), 1)), "structured": sS}
         if "plus_notes" in names:
-            sN = features.pool_embeddings(cfg, sub, "notes", "notes_clinical")
+            sN = features.pool_embeddings(cfg, sub, "notes", "notes_all")
             if cfg.reduction != "none":
-                sN = reduce.apply(sN, cfg.reduction, sA, folds, seed, cfg.pca_components)
+                sN = reduce.apply(sN, cfg.reduction, sA, sY, folds, seed, cfg.pca_components)
             scond["plus_notes"] = np.hstack([sS, sN])
         sboot = list(cluster_bootstrap_indices(sub["subject_id"].to_numpy(), nboot, seed))
         log(f"  [B §1] scope={scope}: n={len(sub):,} (vs all_modality {len(cohort):,})")
@@ -170,10 +185,11 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
 
     # persist per-condition bootstrap replicates (paired; needed by consolidate for
     # dissociation/decomposition/comparisons). Not a §7 file -- underscore-prefixed.
+    all_conds = list(boot_by_cond)            # 5 primary + notes_clinical sensitivity pair
     np.savez(cfg.storage("results", f"_boot_{intervention}.npz"),
              ref_rd=float(ref_rd), baseline_pct=float(baseline_pct),
-             point=np.array([point_by_cond[c] for c in conditions]),
-             conditions=np.array(list(conditions)), **boot_by_cond)
+             point=np.array([point_by_cond[c] for c in all_conds]),
+             conditions=np.array(all_conds), **boot_by_cond)
 
     _reset(cfg, "effects.csv", intervention)
     _reset(cfg, "controls.csv", intervention)

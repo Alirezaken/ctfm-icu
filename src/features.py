@@ -56,6 +56,71 @@ def structured_at_t0(cfg, cohort) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+_VASO_ITEMS = [221906, 221289, 229617, 222315, 221749, 229630, 229631, 229632, 221662]
+# comorbidity history from diagnoses_icd: name -> {(icd_version, code_prefix)}
+_COMORB = {
+    "heart_failure_history": {(9, "428"), (10, "I50")},
+    "ckd_history": {(9, "585"), (10, "N18")},
+    "coronary_artery_disease": {(9, "414"), (9, "410"), (10, "I25"), (10, "I21")},
+    "immunosuppression": {(9, "279"), (10, "D84"), (10, "Z94")},
+}
+# config expert-confounder name -> structured_at_t0 column
+_EXPERT_MAP = {"mean_arterial_pressure": "map", "vasopressor_dose": "vasopressor_use",
+               "vasopressor_use": "vasopressor_use"}
+
+
+def _comorbidities(cfg, cohort, names):
+    dx = pd.read_csv(cfg.input("mimic_dir") / "hosp" / "diagnoses_icd.csv.gz",
+                     usecols=["subject_id", "icd_code", "icd_version"])
+    dx["code"] = dx["icd_code"].astype(str).str.upper()
+    out = pd.DataFrame(index=range(len(cohort)))
+    for name in names:
+        prefs = _COMORB.get(name)
+        if not prefs:
+            continue
+        m = pd.Series(False, index=dx.index)
+        for ver, pre in prefs:
+            m |= (dx["icd_version"] == ver) & dx["code"].str.startswith(pre)
+        subj = set(dx.loc[m, "subject_id"])
+        out[name] = cohort["subject_id"].isin(subj).astype(float).values
+    return out
+
+
+def _sofa_lite(sframe, vaso_flag):
+    """Partial SOFA from available components (renal + coag + cardio); no CNS/resp."""
+    cr = sframe["creatinine"].to_numpy()
+    pl = sframe["platelets"].to_numpy()
+    mp = sframe["map"].to_numpy()
+    s = np.zeros(len(sframe))
+    s += np.select([cr >= 5, cr >= 3.5, cr >= 2, cr >= 1.2], [4, 3, 2, 1], 0)
+    s += np.select([pl < 20, pl < 50, pl < 100, pl < 150], [4, 3, 2, 1], 0)
+    s += np.where(vaso_flag > 0, 3, np.where(mp < 70, 1, 0))
+    return s
+
+
+def expert_features(cfg, cohort, names) -> pd.DataFrame:
+    """The design_based expert-confounder matrix (§5): the intervention's named
+    confounders that we can extract -- structured vitals/labs, a vasopressor flag,
+    a partial SOFA, and comorbidity history. Unmapped names (e.g. infection_source)
+    are omitted (LightGBM handles the reduced set)."""
+    lb = int(cfg.get("pooling.look_back_window_hours", 48))
+    base = structured_at_t0(cfg, cohort)
+    v = ev.read_modality(cfg, "input", _VASO_ITEMS, columns=["subject_id", "time"])
+    v = v.merge(cohort[["subject_id", "t0"]], on="subject_id", how="inner")
+    v = v[(v["time"] < v["t0"]) & (v["time"] >= v["t0"] - pd.Timedelta(hours=lb))]
+    vaso_flag = cohort["subject_id"].isin(set(v["subject_id"])).astype(float).to_numpy()
+    base["vasopressor_use"] = vaso_flag
+    base["sofa_total"] = _sofa_lite(base, vaso_flag)
+    frame = pd.concat([base.reset_index(drop=True), _comorbidities(cfg, cohort, names)], axis=1)
+    cols = []
+    for n in names:
+        c = _EXPERT_MAP.get(n, n)
+        if c in frame.columns and c not in cols:
+            cols.append(c)
+    log(f"  design_based: {len(cols)}/{len(names)} expert confounders extracted")
+    return frame[cols]
+
+
 def negative_control_uti(cfg, cohort) -> np.ndarray:
     """Negative-control outcome `icu_acquired_uti` (§2): UTI diagnosis on the
     cohort admission (ICD-9 599.0*, ICD-10 N39.0*). A treatment like fluid strategy
@@ -70,18 +135,21 @@ def negative_control_uti(cfg, cohort) -> np.ndarray:
     return cohort["hadm_id"].isin(uti_hadm).astype(int).to_numpy()
 
 
-def pool_embeddings(cfg, cohort, modality, variant=None) -> np.ndarray:
-    """Mean-pool pre-t0 vectors within look-back into one proxy per patient.
+def pool_embeddings(cfg, cohort, modality, variant=None,
+                    lookback_h=None, pooling=None) -> np.ndarray:
+    """Pool pre-t0 vectors within look-back into one proxy per patient.
 
-    Fallback: if no item falls in the look-back window, use the patient's most
-    recent pre-t0 item (so all-modality patients always get a proxy). Patients
-    with no pre-t0 item at all get the cohort-mean proxy (imputed).
+    `lookback_h` / `pooling` override the config (used by the robustness swaps:
+    24h window, max-pooling). Fallback: if no item falls in the window, use the
+    patient's most recent pre-t0 item; patients with none get the cohort-mean proxy.
     """
-    lb = int(cfg.get("pooling.look_back_window_hours", 48))
+    lb = int(lookback_h if lookback_h is not None else cfg.get("pooling.look_back_window_hours", 48))
+    rule = pooling or cfg.get("pooling.rule", "mean")
+    agg = (lambda X: X.max(0)) if rule == "max" else (lambda X: X.mean(0))
     idx, V = ev.load_embeddings(cfg, modality)
     idx = idx.reset_index(drop=True)
     idx["vrow"] = np.arange(len(idx))
-    tcol = "study_datetime" if modality == "images" else "charttime"
+    tcol = "charttime" if modality == "notes" else "study_datetime"   # images / images_alt use study time
     idx[tcol] = pd.to_datetime(idx[tcol], errors="coerce")
     if modality == "notes" and variant == "notes_clinical":
         idx = idx[idx["note_type"] == "discharge"]          # radiology excluded
@@ -98,7 +166,7 @@ def pool_embeddings(cfg, cohort, modality, variant=None) -> np.ndarray:
         for sid, rows in frame.groupby("subject_id")["vrow"].apply(list).items():
             i = pos.get(sid)
             if i is not None and np.isnan(proxy[i, 0]):
-                proxy[i] = V[rows].mean(0)
+                proxy[i] = agg(V[rows])
 
     fill(in_win, "window")
     # fallback to most-recent pre-t0 for patients with nothing in the window

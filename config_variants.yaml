@@ -1,18 +1,18 @@
-# config_variants.yaml -- ANALYST-OWNED fix variants (NOT Soroosh's config.yaml).
+# config_variants.yaml -- SENSITIVITY variants (analyst-owned; not the main run).
 #
-# The canonical run uses config.yaml exactly as specified (raw embeddings, §5) and
-# writes to results/. Each variant here changes ONLY how the embeddings enter the
-# estimator (to fix the positivity/overlap breakdown) and writes to its OWN results
-# directory, so nothing of Soroosh's is edited or overwritten. Selected with
-#   python main_causal.py --stage estimate --variant <name>
+# The main run uses config.yaml as-is: embedding_reduction=score (decision 4,
+# Soroosh-approved) -> results/. These variants override the reduction + output dir
+# for the reported sensitivity / failure cases:
+#   python main_causal.py --stage <stage> --variant raw   # raw embeddings (failure case)
+#   python main_causal.py --stage <stage> --variant pca   # PCA-k sensitivity
 #
 variants:
-  # Strong recommendation: compress each embedding modality (768-dim) into ONE
-  # cross-fitted propensity score (the sufficient balancing summary) -> best overlap.
-  pscore:
-    reduction: pscore
-    results_dir: results_pscore
-  # Alternative: unsupervised PCA to a few components per modality.
+  # Raw 1,536-dim embeddings -> breaks overlap. Kept as a REPORTED failure case
+  # (the negative control catching it is a real finding; §5 / decision 4).
+  raw:
+    reduction: none
+    results_dir: results_raw
+  # PCA to a fixed small k per modality -- reported as a sensitivity for decision 4.
   pca:
     reduction: pca
     pca_components: 30

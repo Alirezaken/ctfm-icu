@@ -43,6 +43,70 @@ ANTIBIOTIC_KEYS = ["vancomycin", "piperacillin", "cefepime", "ceftriaxone", "mer
                    "linezolid", "daptomycin", "imipenem", "cefazolin", "clindamycin"]
 
 
+# ---- itemids for the other three interventions (documented design choices) ----
+PO2_ITEM = 50821            # lab pO2 (blood gas)
+FIO2_ITEM = 223835          # chart Inspired O2 Fraction
+PEEP_ITEMS = [220339, 224700]
+POSITION_ITEM = 224093      # chart Position (value_txt e.g. "Prone")
+CREAT_ITEM = 50912
+K_ITEM = 50971
+PH_ITEM = 50820
+RRT_PROC = [225802]         # procedureevents Dialysis - CRRT
+DIALYSIS_CHART = [225126]   # chart "Dialysis patient"
+HB_ITEM = 51222
+RBC_ITEMS = [225168, 220996, 226368, 227070]   # inputevents packed red cells
+
+
+def _icu_base(cfg):
+    """ICU stays with parsed times + adult age at intime; and patients table."""
+    icu = ev.link(cfg, "icu_stays")
+    icu["intime"] = pd.to_datetime(icu["intime"]); icu["outtime"] = pd.to_datetime(icu["outtime"])
+    patients = ev.link(cfg, "patients")
+    p = patients.set_index("subject_id").reindex(icu["subject_id"].values)
+    icu["age_t0"] = p["anchor_age"].values + (icu["intime"].dt.year.values - p["anchor_year"].values)
+    return icu, patients
+
+
+def _labs_in_stays(cfg, itemids, icu):
+    """Attach labevents (no stay_id) to ICU stays by subject_id + time-in-window."""
+    lab = ev.read_modality(cfg, "lab", itemids, columns=["subject_id", "time", "type", "value_num"])
+    lab = lab.merge(icu[["subject_id", "stay_id", "intime", "outtime"]], on="subject_id")
+    return lab[(lab["time"] >= lab["intime"]) & (lab["time"] <= lab["outtime"])]
+
+
+def _chart_in_stays(cfg, itemids, icu, txt=False):
+    cols = ["subject_id", "stay_id", "time", "type", "value_num"] + (["value_txt"] if txt else [])
+    ch = ev.read_modality(cfg, "chart", itemids, columns=cols)
+    ch = ch[ch["stay_id"].isin(set(icu["stay_id"]))].merge(
+        icu[["stay_id", "intime", "outtime"]], on="stay_id")
+    return ch[(ch["time"] >= ch["intime"]) & (ch["time"] <= ch["outtime"])]
+
+
+def _cultures(cfg):
+    """Body-fluid culture order times per subject (microbiologyevents, hosp)."""
+    micro = pd.read_csv(cfg.input("mimic_dir") / "hosp" / "microbiologyevents.csv.gz",
+                        usecols=["subject_id", "charttime", "chartdate"])
+    micro["time"] = pd.to_datetime(micro["charttime"].fillna(micro["chartdate"]), errors="coerce")
+    return micro.dropna(subset=["time"])[["subject_id", "time"]]
+
+
+def _suspected_infection(cfg, elig, abx):
+    """Sepsis-3 suspicion of infection (decision 3): an antibiotic in [intime-24h, t0]
+    AND a body-fluid culture in [intime-48h, t0]. `elig` has subject_id/stay_id/intime/t0;
+    `abx` is antibiotic med events (subject_id, time). Returns the qualifying stay_ids."""
+    keep = elig[["subject_id", "stay_id", "intime", "t0"]]
+    a = abx.merge(keep, on="subject_id")
+    a = a[(a["time"] >= a["intime"] - pd.Timedelta("24h")) & (a["time"] <= a["t0"])]
+    c = _cultures(cfg).merge(keep, on="subject_id")
+    c = c[(c["time"] >= c["intime"] - pd.Timedelta("48h")) & (c["time"] <= c["t0"])]
+    return set(a["stay_id"]) & set(c["stay_id"])
+
+
+def _antibiotic_med(cfg):
+    med = ev.read_modality(cfg, "med", itemids=None, columns=["subject_id", "time", "type"])
+    return med[med["type"].str.contains("|".join(ANTIBIOTIC_KEYS), case=False, na=False)]
+
+
 def _age_at(patients, intimes):
     """Approx age at a timestamp: anchor_age + (year(t) - anchor_year)."""
     p = patients.set_index("subject_id")
@@ -98,45 +162,186 @@ def _build_fluids_sepsis(cfg):
     icu_t0 = icu_1l.merge(t0, on="stay_id", how="inner")
     consort.append(("sepsis_induced_hypotension_after_fluids", len(icu_t0)))
 
-    # suspected infection: >=1 IV antibiotic (drug-name proxy) in [intime-24h, t0]
-    med = ev.read_modality(cfg, "med", itemids=None, columns=["subject_id", "time", "type"])
-    key = "|".join(ANTIBIOTIC_KEYS)
-    med = med[med["type"].str.contains(key, case=False, na=False)]
-    abx = med.merge(icu_t0[["subject_id", "stay_id", "intime", "t0"]], on="subject_id", how="inner")
-    abx = abx[(abx["time"] >= abx["intime"] - pd.Timedelta(hours=24)) & (abx["time"] <= abx["t0"])]
-    infected = set(abx["stay_id"])
+    # suspected infection (decision 3: Sepsis-3) = antibiotic + body-fluid culture
+    infected = _suspected_infection(cfg, icu_t0, _antibiotic_med(cfg))
     icu_elig = icu_t0[icu_t0["stay_id"].isin(infected)].copy()
-    consort.append(("suspected_infection_antibiotic_proxy", len(icu_elig)))
+    consort.append(("suspected_infection_sepsis3", len(icu_elig)))
 
     # one stay per patient (first qualifying) -- patient-level, no double counting
     icu_elig = icu_elig.sort_values("t0").drop_duplicates("subject_id", keep="first")
     consort.append(("eligible_patients_unique", len(icu_elig)))
 
-    # ---- arm assignment: cumulative crystalloid in [t0, t0+24h] vs 30 ml/kg ----
+    # ---- arm assignment (decision 1): cumulative crystalloid per KG in [t0,t0+24h] ----
     wt = ev.read_modality(cfg, "chart", WEIGHT_ITEMS, columns=["subject_id", "time", "value_num"])
     wt = wt[wt["value_num"].between(30, 400)].sort_values("time")
     wt = wt.groupby("subject_id")["value_num"].first().rename("weight_kg")  # earliest plausible wt
     icu_elig = icu_elig.merge(wt, on="subject_id", how="left")
+    icu_elig["weight_kg"] = icu_elig["weight_kg"].fillna(icu_elig["weight_kg"].median())
 
     post = cry.merge(icu_elig[["stay_id", "t0"]], on="stay_id", how="inner")
     post = post[(post["time"] >= post["t0"]) & (post["time"] <= post["t0"] + pd.Timedelta(hours=24))]
     post_vol = post.groupby("stay_id")["value_num"].sum().rename("crystalloid_24h_post_t0")
     icu_elig = icu_elig.merge(post_vol, on="stay_id", how="left")
     icu_elig["crystalloid_24h_post_t0"] = icu_elig["crystalloid_24h_post_t0"].fillna(0.0)
-    thresh = 30.0 * icu_elig["weight_kg"]                     # 30 ml/kg
-    # restrictive (active) if post-t0 crystalloid below 30 ml/kg threshold; else liberal
-    icu_elig["arm"] = np.where(icu_elig["crystalloid_24h_post_t0"] < thresh,
-                               "active", "comparator")
-    icu_elig.loc[icu_elig["weight_kg"].isna(), "arm"] = pd.NA   # undefined without weight
+    icu_elig["mlkg_24h"] = icu_elig["crystalloid_24h_post_t0"] / icu_elig["weight_kg"]
+    # restrictive < 30 ml/kg; if that split is worse than ~70/30, use the cohort median
+    # so overlap is guaranteed (decision 1).
+    thr = 30.0
+    if not (0.30 <= float((icu_elig["mlkg_24h"] < thr).mean()) <= 0.70):
+        thr = float(icu_elig["mlkg_24h"].median())
+    icu_elig["arm"] = np.where(icu_elig["mlkg_24h"] < thr, "active", "comparator")
+    consort.append(("arm_threshold_mlkg", int(round(thr))))
     consort.append(("arm_active_restrictive", int((icu_elig["arm"] == "active").sum())))
     consort.append(("arm_comparator_liberal", int((icu_elig["arm"] == "comparator").sum())))
 
-    cohort = icu_elig[["subject_id", "hadm_id", "stay_id", "intime", "t0",
-                       "age_t0", "weight_kg", "crystalloid_24h_post_t0", "arm"]].copy()
+    cohort = icu_elig[["subject_id", "hadm_id", "stay_id", "intime", "t0", "age_t0",
+                       "weight_kg", "crystalloid_24h_post_t0", "mlkg_24h", "arm"]].copy()
     return cohort, consort
 
 
-_BUILDERS = {"fluids_sepsis": _build_fluids_sepsis}
+def _build_prone_ards(cfg):
+    """Prone vs supine in severe ARDS (PROSEVA). t0 = first severe hypoxemia
+    (P/F<150, FiO2>=0.6, PEEP>=5) within 36h of ICU admit; arm = prone session
+    (chart Position contains 'Prone') within 24h of t0."""
+    consort = []
+    icu, _ = _icu_base(cfg)
+    consort.append(("icu_stays_total", len(icu)))
+    icu = icu[icu["age_t0"] >= 18].copy()
+    consort.append(("adults_ge18", len(icu)))
+
+    po2 = _labs_in_stays(cfg, [PO2_ITEM], icu).rename(columns={"value_num": "po2"}).sort_values("time")
+    fio2 = _chart_in_stays(cfg, [FIO2_ITEM], icu).rename(columns={"value_num": "fio2"}).sort_values("time")
+    fio2["fio2"] = np.where(fio2["fio2"] > 1.5, fio2["fio2"] / 100.0, fio2["fio2"])  # % -> fraction
+    peep = _chart_in_stays(cfg, PEEP_ITEMS, icu).rename(columns={"value_num": "peep"}).sort_values("time")
+    if not len(po2) or not len(fio2):
+        return pd.DataFrame(), consort + [("no_pf_data", 0)]
+
+    tol = pd.Timedelta("4h")
+    m = pd.merge_asof(po2[["stay_id", "time", "po2"]], fio2[["stay_id", "time", "fio2"]],
+                      on="time", by="stay_id", tolerance=tol, direction="backward").dropna(subset=["fio2"])
+    m = pd.merge_asof(m.sort_values("time"), peep[["stay_id", "time", "peep"]].sort_values("time"),
+                      on="time", by="stay_id", tolerance=tol, direction="backward")
+    m["pf"] = m["po2"] / m["fio2"].replace(0, np.nan)
+    severe = m[(m["pf"] < 150) & (m["fio2"] >= 0.6) & (m["peep"] >= 5)]
+    t0 = severe.groupby("stay_id")["time"].min().rename("t0")
+    # 36h window from ventilation start (first PEEP event) if extractable, else ICU admit (decision)
+    vent_start = peep.groupby("stay_id")["time"].min().rename("vent_start")
+    icu = icu.merge(t0, on="stay_id", how="inner").merge(vent_start, on="stay_id", how="left")
+    ref_start = icu["vent_start"].fillna(icu["intime"])
+    icu = icu[icu["t0"] <= ref_start + pd.Timedelta(hours=36)]
+    icu = icu.sort_values("t0").drop_duplicates("subject_id", keep="first")
+    consort.append(("severe_ards_ventilated_within36h", len(icu)))
+
+    pos = _chart_in_stays(cfg, [POSITION_ITEM], icu, txt=True)
+    pos = pos[pos["value_txt"].str.contains("prone", case=False, na=False)]
+    pos = pos.merge(icu[["stay_id", "t0"]], on="stay_id", how="inner")
+    prone_24h = set(pos.loc[(pos["time"] >= pos["t0"]) &
+                            (pos["time"] <= pos["t0"] + pd.Timedelta(hours=24)), "stay_id"])
+    icu["arm"] = np.where(icu["stay_id"].isin(prone_24h), "active", "comparator")
+    consort.append(("arm_active_prone", int((icu["arm"] == "active").sum())))
+    consort.append(("arm_comparator_supine", int((icu["arm"] == "comparator").sum())))
+    icu["weight_kg"] = np.nan
+    return icu[["subject_id", "hadm_id", "stay_id", "intime", "t0", "age_t0", "weight_kg", "arm"]], consort
+
+
+def _build_rrt_timing(cfg):
+    """Early vs delayed RRT in AKI (STARRT-AKI). t0 = first KDIGO stage 2-3
+    (creatinine >=2x stay baseline) without an urgent indication (K<=6.5, pH>=7.2);
+    arm = RRT (CRRT/dialysis) initiated within 12h of t0 vs not."""
+    consort = []
+    icu, _ = _icu_base(cfg)
+    consort.append(("icu_stays_total", len(icu)))
+    icu = icu[icu["age_t0"] >= 18].copy()
+    consort.append(("adults_ge18", len(icu)))
+
+    # baseline creatinine = min over [intime-7d, outtime] so a pre-admission value is used
+    # if one exists, else the stay minimum (decision: RRT baseline).
+    crall = ev.read_modality(cfg, "lab", [CREAT_ITEM], columns=["subject_id", "time", "value_num"])
+    crall = crall.merge(icu[["subject_id", "stay_id", "intime", "outtime"]], on="subject_id")
+    crb = crall[(crall["time"] >= crall["intime"] - pd.Timedelta("7D")) & (crall["time"] <= crall["outtime"])]
+    base = crb.groupby("stay_id")["value_num"].min().rename("cr_base")
+    cr = crall[(crall["time"] >= crall["intime"]) & (crall["time"] <= crall["outtime"])].sort_values("time")
+    cr = cr.merge(base, on="stay_id")
+    stage23 = cr[cr["value_num"] >= 2.0 * cr["cr_base"]]
+    t0 = stage23.groupby("stay_id")["time"].min().rename("t0")
+    icu = icu.merge(t0, on="stay_id", how="inner")
+    consort.append(("aki_kdigo_stage2_3", len(icu)))
+
+    # exclude urgent indication near t0: K>6.5 or pH<7.2 within +/-6h of t0
+    def _near_t0(itemids, cmp):
+        lab = _labs_in_stays(cfg, itemids, icu).merge(icu[["stay_id", "t0"]], on="stay_id")
+        lab = lab[(lab["time"] >= lab["t0"] - pd.Timedelta("6h")) & (lab["time"] <= lab["t0"] + pd.Timedelta("6h"))]
+        return set(lab.loc[cmp(lab["value_num"]), "stay_id"])
+    urgent = _near_t0([K_ITEM], lambda v: v > 6.5) | _near_t0([PH_ITEM], lambda v: v < 7.2)
+    icu = icu[~icu["stay_id"].isin(urgent)]
+    icu = icu.sort_values("t0").drop_duplicates("subject_id", keep="first")
+    consort.append(("no_urgent_indication", len(icu)))
+
+    rrt = pd.concat([
+        ev.read_modality(cfg, "procedure", RRT_PROC, columns=["stay_id", "time", "value_num"]),
+        ev.read_modality(cfg, "chart", DIALYSIS_CHART, columns=["stay_id", "time", "value_num"]),
+    ], ignore_index=True)
+    rrt = rrt[rrt["stay_id"].isin(set(icu["stay_id"]))].merge(icu[["stay_id", "t0"]], on="stay_id")
+    early = set(rrt.loc[(rrt["time"] >= rrt["t0"]) &
+                        (rrt["time"] <= rrt["t0"] + pd.Timedelta(hours=12)), "stay_id"])
+    icu["arm"] = np.where(icu["stay_id"].isin(early), "active", "comparator")
+    consort.append(("arm_active_accelerated", int((icu["arm"] == "active").sum())))
+    consort.append(("arm_comparator_standard", int((icu["arm"] == "comparator").sum())))
+    icu["weight_kg"] = np.nan
+    return icu[["subject_id", "hadm_id", "stay_id", "intime", "t0", "age_t0", "weight_kg", "arm"]], consort
+
+
+def _build_transfusion_threshold(cfg):
+    """Restrictive vs liberal transfusion in septic shock (TRISS). Eligible = septic
+    shock (infection + vasopressor) with Hb<9. t0 = first Hb<9. Arm from the Hb just
+    before the first post-t0 RBC transfusion: <=7 restrictive, (7,9] liberal
+    (never-transfused patients cannot be assigned a threshold -> excluded)."""
+    consort = []
+    icu, _ = _icu_base(cfg)
+    consort.append(("icu_stays_total", len(icu)))
+    icu = icu[icu["age_t0"] >= 18].copy()
+    consort.append(("adults_ge18", len(icu)))
+
+    # septic shock: vasopressor during stay + Hb<9 -> t0; infection confirmed at t0
+    vaso = ev.read_modality(cfg, "input", VASOPRESSOR_ITEMS, columns=["subject_id", "stay_id", "time"])
+    shock = set(vaso[vaso["stay_id"].isin(set(icu["stay_id"]))]["stay_id"])
+    icu = icu[icu["stay_id"].isin(shock)]
+    consort.append(("vasopressor_shock", len(icu)))
+
+    hb = _labs_in_stays(cfg, [HB_ITEM], icu).rename(columns={"value_num": "hb"}).sort_values("time")
+    t0 = hb[hb["hb"] < 9.0].groupby("stay_id")["time"].min().rename("t0")
+    icu = icu.merge(t0, on="stay_id", how="inner")
+    icu = icu.sort_values("t0").drop_duplicates("subject_id", keep="first")
+    consort.append(("hb_lt9", len(icu)))
+    infected = _suspected_infection(cfg, icu, _antibiotic_med(cfg))     # decision 3
+    icu = icu[icu["stay_id"].isin(infected)]
+    consort.append(("suspected_infection_sepsis3", len(icu)))
+
+    # Arm by threshold the Hb trajectory is consistent with (decision: KEEP never-transfused).
+    # Transfused: restrictive if pre-transfusion Hb<=7, else liberal. Never transfused =
+    # restrictive-consistent (a liberal strategy would have transfused at Hb<9).
+    rbc = ev.read_modality(cfg, "input", RBC_ITEMS, columns=["stay_id", "time"])
+    rbc = rbc[rbc["stay_id"].isin(set(icu["stay_id"]))].merge(icu[["stay_id", "t0"]], on="stay_id")
+    rbc = rbc[rbc["time"] >= rbc["t0"]].sort_values("time")
+    first_tx = rbc.groupby("stay_id")["time"].min().rename("tx_time").reset_index()
+    hb_pre = pd.merge_asof(first_tx.sort_values("tx_time"),
+                           hb[["stay_id", "time", "hb"]].sort_values("time"),
+                           left_on="tx_time", right_on="time", by="stay_id", direction="backward")
+    tx_arm = dict(zip(hb_pre["stay_id"], np.where(hb_pre["hb"] <= 7.0, "active", "comparator")))
+    icu["arm"] = icu["stay_id"].map(tx_arm).fillna("active")   # never-transfused -> restrictive
+    consort.append(("transfused_post_t0", len(first_tx)))
+    consort.append(("arm_active_restrictive", int((icu["arm"] == "active").sum())))
+    consort.append(("arm_comparator_liberal", int((icu["arm"] == "comparator").sum())))
+    icu["weight_kg"] = np.nan
+    return icu[["subject_id", "hadm_id", "stay_id", "intime", "t0", "age_t0", "weight_kg", "arm"]], consort
+
+
+_BUILDERS = {
+    "fluids_sepsis": _build_fluids_sepsis,
+    "prone_positioning": _build_prone_ards,
+    "rrt_timing": _build_rrt_timing,
+    "transfusion_threshold": _build_transfusion_threshold,
+}
 
 
 def _outcome_and_gate(cfg, intervention, cohort, consort):
@@ -160,17 +365,22 @@ def _outcome_and_gate(cfg, intervention, cohort, consort):
     pre_cxr = cxr.merge(cohort[["subject_id", "t0"]], on="subject_id", how="inner")
     has_cxr = set(pre_cxr.loc[pre_cxr["study_datetime"] < pre_cxr["t0"], "subject_id"])
 
-    disch = pd.read_csv(cfg.input("notes_dir") / "note" / "discharge.csv.gz",
-                        usecols=["subject_id", "charttime"])
-    disch["charttime"] = pd.to_datetime(disch["charttime"], errors="coerce")
-    pre_note = disch.merge(cohort[["subject_id", "t0"]], on="subject_id", how="inner")
-    has_note = set(pre_note.loc[pre_note["charttime"] < pre_note["t0"], "subject_id"])
+    # note gate relaxed (decision 2): discharge OR radiology report counts.
+    note_root = cfg.input("notes_dir") / "note"
+    def _pre_t0_subjects(fname):
+        n = pd.read_csv(note_root / fname, usecols=["subject_id", "charttime"])
+        n["charttime"] = pd.to_datetime(n["charttime"], errors="coerce")
+        m = n.merge(cohort[["subject_id", "t0"]], on="subject_id", how="inner")
+        return set(m.loc[m["charttime"] < m["t0"], "subject_id"])
+    has_disch = _pre_t0_subjects("discharge.csv.gz")
+    has_rad = _pre_t0_subjects("radiology.csv.gz")
 
     cohort["has_pre_t0_cxr"] = cohort["subject_id"].isin(has_cxr)
-    cohort["has_pre_t0_note"] = cohort["subject_id"].isin(has_note)
+    cohort["has_pre_t0_note"] = cohort["subject_id"].isin(has_disch | has_rad)   # primary
+    cohort["has_pre_t0_disch_note"] = cohort["subject_id"].isin(has_disch)       # sensitivity
     cohort["all_modality"] = cohort["has_pre_t0_cxr"] & cohort["has_pre_t0_note"]
     consort.append(("with_pre_t0_frontal_cxr", int(cohort["has_pre_t0_cxr"].sum())))
-    consort.append(("with_pre_t0_discharge_note", int(cohort["has_pre_t0_note"].sum())))
+    consort.append(("with_pre_t0_note_incl_radiology", int(cohort["has_pre_t0_note"].sum())))
     consort.append(("all_modality_cohort", int(cohort["all_modality"].sum())))
     consort.append(("all_modality_deaths", int(cohort.loc[cohort["all_modality"], "outcome"].sum())))
     return cohort, consort

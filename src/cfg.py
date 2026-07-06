@@ -43,10 +43,11 @@ class Config:
     def __init__(self, data: dict, path: Path):
         self._d = data
         self.path = path
-        # variant overlay (analyst-owned; never edits config.yaml). Default = raw.
-        self.reduction = "none"        # embedding reduction: none|pscore|pca
-        self.pca_components = 30
-        self._results_override = None  # e.g. "results_pscore" for a fix variant
+        # embedding reduction: default comes from config (decision 4 = 'score');
+        # a --variant may override it (e.g. 'raw'/'pca' sensitivity runs).
+        self.reduction = self.get("estimator.embedding_reduction", "none")
+        self.pca_components = int(self.get("estimator.pca_components", 30))
+        self._results_override = None  # variant results dir override
 
     def apply_variant(self, results_dir: str, reduction: str, pca_components: int = 30):
         """Overlay a fix variant: change how embeddings enter + where results go.

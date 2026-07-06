@@ -39,3 +39,46 @@ def crossfit_aipw(X, A, Y, folds, seed, trim=0.01):
             "frac_trimmed": float((~keep).mean()), "ess": float(ess),
             "n": int(keep.sum())}
     return psi, keep, diag
+
+
+def crossfit_tmle(X, A, Y, folds, seed, trim=0.01):
+    """Cross-fitted TMLE for the risk difference (robustness swap for AIPW).
+
+    Same interface/return as crossfit_aipw: a per-patient efficient-influence
+    pseudo-outcome psi (mean = the targeted ATE), an overlap-trim mask, diagnostics.
+    """
+    from scipy.special import logit, expit
+    X = np.asarray(X, dtype=float); A = np.asarray(A, int); Y = np.asarray(Y, int)
+    n = len(Y)
+    g = np.zeros(n); Q0 = np.zeros(n); Q1 = np.zeros(n)
+    kf = KFold(folds, shuffle=True, random_state=seed)
+    for tr, te in kf.split(X):
+        g[te] = LGBMClassifier(**_PARAMS).fit(X[tr], A[tr]).predict_proba(X[te])[:, 1]
+        om = LGBMClassifier(**_PARAMS).fit(np.column_stack([X[tr], A[tr]]), Y[tr])
+        Q1[te] = om.predict_proba(np.column_stack([X[te], np.ones(len(te))]))[:, 1]
+        Q0[te] = om.predict_proba(np.column_stack([X[te], np.zeros(len(te))]))[:, 1]
+    eps_c = 1e-6
+    g = np.clip(g, trim, 1 - trim)
+    Q0 = np.clip(Q0, eps_c, 1 - eps_c); Q1 = np.clip(Q1, eps_c, 1 - eps_c)
+    QA = np.where(A == 1, Q1, Q0)
+    H = A / g - (1 - A) / (1 - g)                       # clever covariate
+    # targeting: 1-D Newton for the fluctuation eps (logistic, offset logit(QA))
+    off = logit(QA); eps = 0.0
+    for _ in range(100):
+        p = expit(off + eps * H)
+        score = np.sum(H * (Y - p)); info = np.sum(H * H * p * (1 - p))
+        if info < 1e-12:
+            break
+        step = score / info; eps += step
+        if abs(step) < 1e-8:
+            break
+    Q1s = expit(logit(Q1) + eps * (1.0 / g))
+    Q0s = expit(logit(Q0) - eps * (1.0 / (1 - g)))
+    QAs = expit(off + eps * H)
+    keep = (g > trim) & (g < 1 - trim)
+    psi = (Q1s - Q0s) + H * (Y - QAs)                  # efficient influence pseudo-outcome
+    w = np.where(A == 1, 1.0 / g, 1.0 / (1 - g))
+    ess = (w[keep].sum() ** 2) / np.sum(w[keep] ** 2)
+    diag = {"e_min": float(g.min()), "e_max": float(g.max()),
+            "frac_trimmed": float((~keep).mean()), "ess": float(ess), "n": int(keep.sum())}
+    return psi, keep, diag
