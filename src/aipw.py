@@ -20,24 +20,37 @@ _PARAMS = dict(n_estimators=300, learning_rate=0.05, num_leaves=15,
                reg_lambda=1.0, verbosity=-1, n_jobs=4)
 
 
-def crossfit_aipw(X, A, Y, folds, seed, trim=0.01):
+def crossfit_aipw(X, A, Y, folds, seed, trim=0.01, D=None):
+    """Cross-fitted AIPW risk difference, with optional inverse-probability-of-
+    censoring weighting (§4). D = observed indicator (1 = outcome status known at the
+    horizon, 0 = administratively censored). When D is None or all-ones this is plain
+    AIPW; otherwise a censoring model Kc(X)=P(D=1|X) is cross-fitted (same covariates
+    as the outcome model), outcome models are fit on the observed only, and the
+    augmentation term is weighted by D/Kc so the risk difference stays well defined."""
     X = np.asarray(X, dtype=float); A = np.asarray(A, int); Y = np.asarray(Y, int)
     n = len(Y)
-    e = np.zeros(n); m1 = np.zeros(n); m0 = np.zeros(n)
+    D = np.ones(n, int) if D is None else np.asarray(D, int)
+    e = np.zeros(n); m1 = np.zeros(n); m0 = np.zeros(n); Kc = np.ones(n)
+    censored = D.min() == 0
     kf = KFold(folds, shuffle=True, random_state=seed)
     for tr, te in kf.split(X):
         e[te] = LGBMClassifier(**_PARAMS).fit(X[tr], A[tr]).predict_proba(X[te])[:, 1]
+        if censored:
+            Kc[te] = LGBMClassifier(**_PARAMS).fit(X[tr], D[tr]).predict_proba(X[te])[:, 1]
         for a, m in ((1, m1), (0, m0)):
-            sel = tr[A[tr] == a]
+            sel = tr[(A[tr] == a) & (D[tr] == 1)]        # outcome model on the observed
             m[te] = LGBMClassifier(**_PARAMS).fit(X[sel], Y[sel]).predict_proba(X[te])[:, 1]
     e = np.clip(e, 1e-6, 1 - 1e-6)
+    Kc = np.clip(Kc, trim, 1.0)
     keep = (e > trim) & (e < 1 - trim)
-    psi = (m1 - m0) + A * (Y - m1) / e - (1 - A) * (Y - m0) / (1 - e)
+    cw = D / Kc                                          # censoring weight (1 when uncensored)
+    psi = (m1 - m0) + cw * (A * (Y - m1) / e - (1 - A) * (Y - m0) / (1 - e))
     w = np.where(A == 1, 1.0 / e, 1.0 / (1 - e))
     ess = (w[keep].sum() ** 2) / np.sum(w[keep] ** 2)
     diag = {"e_min": float(e.min()), "e_max": float(e.max()),
             "frac_trimmed": float((~keep).mean()), "ess": float(ess),
-            "n": int(keep.sum()), "e": e}          # propensity, for §7.6 balance/weighting
+            "n": int(keep.sum()), "e": e,                # propensity, for §7.6 balance/weighting
+            "frac_censored": float((D == 0).mean())}
     return psi, keep, diag
 
 

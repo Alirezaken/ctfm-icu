@@ -59,6 +59,7 @@ def _spine(cfg):
     p["sex_male"] = (p["gender"] == "Male").astype(float)
     p["weight_kg"] = pd.to_numeric(p["admissionweight"], errors="coerce")
     p["died_hosp"] = (p["hospitaldischargestatus"] == "Expired").astype(int)
+    p["disp_known"] = p["hospitaldischargestatus"].isin(["Alive", "Expired"]).astype(int)
     p["death_offset"] = pd.to_numeric(p["hospitaldischargeoffset"], errors="coerce")
     # patient-level (§1): keep one unit stay per patient
     p = p.sort_values("patientunitstayid").drop_duplicates("uniquepid", keep="first")
@@ -88,27 +89,56 @@ def _match(cfg, table, col, offcol, keys):
     return df[m].copy()
 
 
+_IO_CACHE = {}
+
+
+def _intake_output(cfg):
+    """intakeOutput rows, read once (229 MB), for crystalloid volume and RBC transfusions."""
+    key = str(cfg.input("eicu_dir"))
+    if key not in _IO_CACHE:
+        _IO_CACHE[key] = _eicu(cfg, "intakeOutput", usecols=[
+            "patientunitstayid", "intakeoutputoffset", "cellpath", "cellvaluenumeric"])
+    return _IO_CACHE[key]
+
+
+def _crystalloid_ml_24h(cfg):
+    """Cumulative crystalloid volume (mL) in the first 24 h, per stay (real I&O flowsheet)."""
+    io = _intake_output(cfg)
+    cr = io[io["cellpath"].str.contains("Crystalloids (ml)", na=False, regex=False)
+            & (io["intakeoutputoffset"] >= 0) & (io["intakeoutputoffset"] <= 1440)]
+    return cr.groupby("patientunitstayid")["cellvaluenumeric"].sum()
+
+
+def _rbc_first_offset(cfg):
+    """Offset (min) of the first red-cell transfusion per stay (I&O blood-products)."""
+    io = _intake_output(cfg)
+    rbc = io[io["cellpath"].str.contains("Transfuse red blood cells", na=False, regex=False)
+             & (io["cellvaluenumeric"] > 0)]
+    return rbc.groupby("patientunitstayid")["intakeoutputoffset"].min()
+
+
 # ----------------------------------------------------------------- builders
 # each returns a cohort frame: patientunitstayid, arm ('active'/'comparator'), t0_offset
 
 def _b_transfusion(cfg, spine):
-    """Restrictive (transfuse at Hb<=7) vs liberal (Hb<=9) in septic shock, Hb<9."""
+    """Restrictive (transfuse at Hb<=7) vs liberal (Hb<=9) in septic shock, Hb<9.
+    Transfusions from the I&O blood-products flowsheet ('Transfuse red blood cells'),
+    which captures far more transfusion events than the treatment strings."""
     shock = set(_match(cfg, "diagnosis", "diagnosisstring", "diagnosisoffset",
                        ["septic shock", "sepsis with shock"])["patientunitstayid"])
     hb = _lab(cfg, ["Hgb"])
     low = hb[hb["labresult"] < 9.0]
     t0 = low.groupby("patientunitstayid")["labresultoffset"].min()          # first Hb<9
     elig = t0.index[t0.index.isin(shock)]
-    tx = _match(cfg, "treatment", "treatmentstring", "treatmentoffset",
-                ["packed red blood cell", "prbc", "transfusion of blood product"])
-    first_tx = tx.groupby("patientunitstayid")["treatmentoffset"].min()
+    first_tx = _rbc_first_offset(cfg)
     rows = []
     for sid in elig:
         t0off = float(t0[sid])
         if sid in first_tx.index:
             txoff = float(first_tx[sid])
-            pre = hb[(hb["patientunitstayid"] == sid) & (hb["labresultoffset"] <= txoff)]["labresult"]
-            hb_at_tx = pre.min() if len(pre) else np.nan
+            pre = hb[(hb["patientunitstayid"] == sid) & (hb["labresultoffset"] <= txoff)]
+            pre = pre.sort_values("labresultoffset")["labresult"]
+            hb_at_tx = pre.iloc[-1] if len(pre) else np.nan     # trigger Hb (last before tx), not nadir
             arm = "active" if (np.isnan(hb_at_tx) or hb_at_tx <= 7.0) else "comparator"
         else:
             arm = "active"                                                   # never transfused = restrictive-consistent
@@ -140,29 +170,33 @@ def _b_rrt(cfg, spine):
 
 
 def _b_fluids(cfg, spine):
-    """Restrictive (early vasopressor) vs liberal (fluid resuscitation, no early pressor)
-    in suspected sepsis with hypotension. t0 = unit admit (eligibility is <=24h of admit).
-    Crystalloid mL/kg is not reconstructable cleanly in eICU, so the arm proxy is
-    vasopressor-first (restrictive) vs fluid-first (liberal) -- a documented proxy."""
+    """Restrictive vs liberal fluids in suspected sepsis with hypotension, by REAL
+    cumulative crystalloid mL/kg in the first 24 h (I&O flowsheet 'Crystalloids (ml)'
+    / admission weight) -- the same estimand as MIMIC. Threshold 30 mL/kg; if that
+    splits worse than 70/30 use the cohort median (mirrors MIMIC Decision 1).
+    t0 = unit admit (eligibility is within 24 h of admit)."""
     sepsis = set(_match(cfg, "diagnosis", "diagnosisstring", "diagnosisoffset",
                         ["sepsis", "septic"])["patientunitstayid"])
-    vaso = _match(cfg, "treatment", "treatmentstring", "treatmentoffset",
-                  ["vasopressor", "norepinephrine", "vasopressin", "phenylephrine",
-                   "epinephrine", "dopamine"])
-    fluid = _match(cfg, "treatment", "treatmentstring", "treatmentoffset",
-                   ["fluid resuscitation", "normal saline", "lactated ringer", "fluid bolus",
-                    "isotonic"])
-    v_first = vaso.groupby("patientunitstayid")["treatmentoffset"].min()
-    f_first = fluid.groupby("patientunitstayid")["treatmentoffset"].min()
-    elig = sepsis & (set(v_first.index) | set(f_first.index))
-    rows = []
+    aps = _aps(cfg)
+    hypo = set(aps.index[aps["meanbp"] < 65])
+    vaso = set(_match(cfg, "treatment", "treatmentstring", "treatmentoffset",
+                      ["vasopressor", "norepinephrine", "vasopressin", "phenylephrine",
+                       "epinephrine", "dopamine"])["patientunitstayid"])
+    crys = _crystalloid_ml_24h(cfg)
+    wt = spine.set_index("patientunitstayid")["weight_kg"]
+    elig = sepsis & (hypo | vaso) & set(crys.index)
+    mlkg = {}
     for sid in elig:
-        vo = float(v_first[sid]) if sid in v_first.index else np.inf
-        fo = float(f_first[sid]) if sid in f_first.index else np.inf
-        if not np.isfinite(vo) and not np.isfinite(fo):
-            continue
-        arm = "active" if vo <= fo else "comparator"                        # pressor-first = restrictive
-        rows.append((sid, arm, 0.0))
+        w = wt.get(sid, np.nan)
+        if w and w > 0 and np.isfinite(w):
+            mlkg[sid] = float(crys[sid]) / float(w)
+    if len(mlkg) < 50:
+        return pd.DataFrame(columns=["patientunitstayid", "arm", "t0_offset"])
+    vals = pd.Series(mlkg)
+    thr = 30.0
+    if not (0.30 <= (vals < thr).mean() <= 0.70):
+        thr = float(vals.median())                                          # guarantee overlap
+    rows = [(sid, "active" if v < thr else "comparator", 0.0) for sid, v in vals.items()]
     return pd.DataFrame(rows, columns=["patientunitstayid", "arm", "t0_offset"])
 
 
@@ -213,21 +247,24 @@ def _one(cfg, intervention, spine, aps, seed, folds, nboot):
     ref = iv["rct_reference"]; ref_rd = ref["risk_difference"]; ref_lo, ref_hi = ref["ci"]
 
     coh = _BUILDERS[intervention](cfg, spine).drop_duplicates("patientunitstayid")
-    coh = coh.merge(spine[["patientunitstayid", "uniquepid", "died_hosp", "death_offset"]],
+    coh = coh.merge(spine[["patientunitstayid", "uniquepid", "died_hosp", "death_offset", "disp_known"]],
                     on="patientunitstayid", how="inner").reset_index(drop=True)
     if len(coh) < 50:
         log(f"  {intervention}: eICU cohort too small (n={len(coh)}); skip"); return None
 
-    # outcome: in-hospital death within horizon of t0
+    # outcome: in-hospital death within horizon of t0 (discharge alive = survived, a
+    # documented eICU convention -- no post-discharge death observed). Censoring
+    # indicator D = disposition known (§4 IPCW); status-unknown patients are weighted out.
     within = (coh["death_offset"] - coh["t0_offset"]) <= horizon
     Y = ((coh["died_hosp"] == 1) & within).astype(int).to_numpy()
     A = (coh["arm"] == "active").astype(int).to_numpy()
+    D = coh["disp_known"].astype(int).to_numpy()
     if A.min() == A.max() or Y.sum() < 10 or (A == 0).sum() < 20 or (A == 1).sum() < 20:
         log(f"  {intervention}: eICU arms/events too thin "
             f"(n={len(coh)}, active={A.sum()}, deaths={Y.sum()}); skip"); return None
 
     X = _structured_matrix(coh, spine, aps).to_numpy(dtype=float)
-    psi, keep, diag = aipw.crossfit_aipw(X, A, Y, folds, seed)
+    psi, keep, diag = aipw.crossfit_aipw(X, A, Y, folds, seed, D=D)
     point = float(psi[keep].mean() * 100)
     boot = list(cluster_bootstrap_indices(coh["uniquepid"].to_numpy(), nboot, seed))
     bvals = [psi[b][keep[b]].mean() * 100 for b in boot]
@@ -236,7 +273,7 @@ def _one(cfg, intervention, spine, aps, seed, folds, nboot):
     bias = bootstrap_summary(point - ref_rd, [v - ref_rd for v in bvals])
     log(f"  {intervention}: eICU n={len(coh)} active={A.sum()} deaths={Y.sum()} "
         f"RD={point:.1f} [{eff.ci_low:.1f},{eff.ci_high:.1f}] ESS={round(diag['ess'])} "
-        f"inside_ref={ref_lo <= point <= ref_hi}")
+        f"cens={diag['frac_censored']*100:.1f}% inside_ref={ref_lo <= point <= ref_hi}")
     return {
         "intervention": intervention, "condition": "structured", "cohort": "eicu_all",
         "dataset": "eicu", "method": "aipw",

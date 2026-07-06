@@ -121,6 +121,24 @@ def expert_features(cfg, cohort, names) -> pd.DataFrame:
     return frame[cols]
 
 
+def observed_at_horizon(cfg, cohort, horizon_days: int) -> np.ndarray:
+    """§4 censoring indicator D: 1 if the patient's vital status at t0+horizon is
+    KNOWN, 0 if administratively censored. MIMIC-IV `dod` is a state death registry
+    covering ~1 year past the last hospital discharge, so status is known when the
+    patient (a) died by the horizon, or (b) has a dod after the horizon, or (c) has
+    no dod but the registry window (last discharge + 365d) reaches the horizon.
+    Discharge is therefore NOT a competing event -- post-discharge death is observed."""
+    adm = pd.read_csv(cfg.input("mimic_dir") / "hosp" / "admissions.csv.gz",
+                      usecols=["subject_id", "dischtime"], parse_dates=["dischtime"])
+    last_dis = adm.groupby("subject_id")["dischtime"].max()
+    t0 = pd.to_datetime(cohort["t0"]); dod = pd.to_datetime(cohort["dod"])
+    hz = t0 + pd.Timedelta(days=horizon_days)
+    ld = pd.to_datetime(last_dis.reindex(cohort["subject_id"].values).values)
+    reg_covers = (ld + pd.Timedelta(days=365)) >= hz
+    known = (dod.notna() & (dod <= hz)) | (dod.notna() & (dod > hz)) | (dod.isna() & reg_covers)
+    return known.fillna(False).astype(int).to_numpy()
+
+
 def negative_control_uti(cfg, cohort) -> np.ndarray:
     """Negative-control outcome `icu_acquired_uti` (§2): UTI diagnosis on the
     cohort admission (ICD-9 599.0*, ICD-10 N39.0*). A treatment like fluid strategy

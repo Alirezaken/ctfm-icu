@@ -51,6 +51,8 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
     A = (cohort["arm"] == "active").astype(int).to_numpy()
     Y = cohort["outcome"].astype(int).to_numpy()
     subj = cohort["subject_id"].to_numpy()
+    horizon = int(cfg.get(f"interventions.{intervention}.horizon_days"))
+    D_obs = features.observed_at_horizon(cfg, cohort, horizon)   # §4 censoring indicator (IPCW)
     log(f"estimate[{intervention}]: all-modality cohort n={len(cohort):,} "
         f"(active={A.sum():,}, comparator={(A==0).sum():,}, deaths={Y.sum():,})")
     nc = features.negative_control_uti(cfg, cohort)     # §6.4 negative-control outcome
@@ -95,7 +97,7 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
     boot_by_cond, point_by_cond = {}, {}
     psi_by_cond, keep_by_cond, e_by_cond = {}, {}, {}
     for name, X in conditions.items():
-        psi, keep, diag = aipw.crossfit_aipw(X, A, Y, folds, seed)
+        psi, keep, diag = aipw.crossfit_aipw(X, A, Y, folds, seed, D=D_obs)
         point = float(psi[keep].mean() * 100)
         bvals = [psi[b][keep[b]].mean() * 100 for b in boot]
         boot_by_cond[name] = np.asarray(bvals, dtype=float)
@@ -146,6 +148,13 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
                              "metric": "min_detectable_rd_pp__structured", "stratum": "",
                              "arm": "", "value": mde, "support_count": int(keep_by_cond["structured"].sum())})
             log(f"  minimum detectable RD (structured, 80% power): {mde:.2f} pp")
+
+    # ---- §4 censoring diagnostic (IPCW): fraction with unknown status at horizon ----
+    frac_cens = float((D_obs == 0).mean())
+    coh_rows.append({"intervention": intervention, "section": "censoring",
+                     "metric": f"frac_censored_at_{horizon}d", "stratum": "", "arm": "",
+                     "value": round(frac_cens, 4), "support_count": len(D_obs)})
+    log(f"  censoring at {horizon}d: {frac_cens*100:.2f}% (IPCW; MIMIC dod gives complete follow-up)")
 
     # ---- §7.6 covariate balance before/after weighting (structured set) ----
     e_s = np.clip(e_by_cond["structured"], 1e-6, 1 - 1e-6)
@@ -244,7 +253,7 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
     _reset(cfg, "effects.csv", intervention)
     _reset(cfg, "controls.csv", intervention)
     _reset(cfg, "cohorts.csv", intervention,
-           section=["overlap_ess", "mde", "balance", "missingness"])
+           section=["overlap_ess", "mde", "balance", "missingness", "censoring"])
     R.append_rows(cfg, "effects.csv", eff_rows)
     R.append_rows(cfg, "controls.csv", ctrl_rows)
     R.append_rows(cfg, "cohorts.csv", coh_rows)
