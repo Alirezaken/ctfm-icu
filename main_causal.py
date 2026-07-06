@@ -35,8 +35,8 @@ def _parse_args(argv=None):
     p.add_argument("--intervention", default=None,
                    help="intervention key for per-intervention stages (default: fluids_sepsis)")
     p.add_argument("--variant", default=None,
-                   help="embedding-fix variant from config_variants.yaml (e.g. pscore); "
-                        "writes to its own results dir, leaving config.yaml + results/ untouched")
+                   help="sensitivity variant from config.yaml `variants:` (raw | pca); "
+                        "writes to its own results dir, leaving results/ untouched")
     p.add_argument("--force", action="store_true", help="ignore checkpoints / recompute")
     p.add_argument("--list", action="store_true", help="list stages and exit")
     return p.parse_args(argv)
@@ -68,9 +68,7 @@ def main(argv=None):
     log(f"storage_root: {cfg.storage_root}")
 
     if args.variant:
-        import yaml
-        vpath = Path(__file__).resolve().parent / "config_variants.yaml"
-        vdefs = (yaml.safe_load(open(vpath)) or {}).get("variants", {})
+        vdefs = cfg.get("variants") or {}
         if args.variant not in vdefs:
             die(f"unknown variant '{args.variant}'. Known: {', '.join(vdefs)}")
         v = vdefs[args.variant]

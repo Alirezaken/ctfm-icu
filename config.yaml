@@ -99,6 +99,21 @@ estimator:
   # 'raw' (failure case) and 'pca' (sensitivity) are run as --variant overrides.
   embedding_reduction: score
 
+# SENSITIVITY variants (decision 4): --variant <name> overrides the embedding
+# reduction + output dir. The main run uses the estimator block above (score ->
+# results/). Reported alongside: raw = the overlap failure case (negative control
+# catches it, a real finding); pca = PCA-k sensitivity.
+#   python main_causal.py --stage <stage> --variant raw   # raw 1,536-d embeddings
+#   python main_causal.py --stage <stage> --variant pca   # PCA-k per modality
+variants:
+  raw:
+    reduction: none
+    results_dir: results_raw
+  pca:
+    reduction: pca
+    pca_components: 30
+    results_dir: results_pca
+
 conditions: [naive, structured, plus_notes, plus_imaging_only, full, design_based]
 
 robustness_swaps:
