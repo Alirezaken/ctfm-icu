@@ -65,8 +65,8 @@ _COMORB = {
     "immunosuppression": {(9, "279"), (10, "D84"), (10, "Z94")},
 }
 # config expert-confounder name -> structured_at_t0 column
-_EXPERT_MAP = {"mean_arterial_pressure": "map", "vasopressor_dose": "vasopressor_use",
-               "vasopressor_use": "vasopressor_use"}
+_EXPERT_MAP = {"sex": "sex_male", "mean_arterial_pressure": "map",
+               "vasopressor_dose": "vasopressor_use", "vasopressor_use": "vasopressor_use"}
 
 
 def _comorbidities(cfg, cohort, names):

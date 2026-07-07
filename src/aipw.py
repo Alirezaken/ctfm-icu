@@ -54,32 +54,38 @@ def crossfit_aipw(X, A, Y, folds, seed, trim=0.01, D=None):
     return psi, keep, diag
 
 
-def crossfit_tmle(X, A, Y, folds, seed, trim=0.01):
-    """Cross-fitted TMLE for the risk difference (robustness swap for AIPW).
-
-    Same interface/return as crossfit_aipw: a per-patient efficient-influence
-    pseudo-outcome psi (mean = the targeted ATE), an overlap-trim mask, diagnostics.
+def crossfit_tmle(X, A, Y, folds, seed, trim=0.01, D=None):
+    """Cross-fitted TMLE for the risk difference (robustness swap for AIPW), with the
+    same optional IPCW as crossfit_aipw (D = observed indicator; the clever covariate
+    and targeting are weighted by D/Kc, outcome models fit on the observed). Returns a
+    per-patient efficient-influence pseudo-outcome psi, an overlap-trim mask, diagnostics.
     """
     from scipy.special import logit, expit
     X = np.asarray(X, dtype=float); A = np.asarray(A, int); Y = np.asarray(Y, int)
     n = len(Y)
-    g = np.zeros(n); Q0 = np.zeros(n); Q1 = np.zeros(n)
+    D = np.ones(n, int) if D is None else np.asarray(D, int)
+    g = np.zeros(n); Q0 = np.zeros(n); Q1 = np.zeros(n); Kc = np.ones(n)
+    censored = D.min() == 0
     kf = KFold(folds, shuffle=True, random_state=seed)
     for tr, te in kf.split(X):
         g[te] = LGBMClassifier(**_PARAMS).fit(X[tr], A[tr]).predict_proba(X[te])[:, 1]
-        om = LGBMClassifier(**_PARAMS).fit(np.column_stack([X[tr], A[tr]]), Y[tr])
+        if censored:
+            Kc[te] = LGBMClassifier(**_PARAMS).fit(X[tr], D[tr]).predict_proba(X[te])[:, 1]
+        obs = tr[D[tr] == 1]                            # outcome model on the observed
+        om = LGBMClassifier(**_PARAMS).fit(np.column_stack([X[obs], A[obs]]), Y[obs])
         Q1[te] = om.predict_proba(np.column_stack([X[te], np.ones(len(te))]))[:, 1]
         Q0[te] = om.predict_proba(np.column_stack([X[te], np.zeros(len(te))]))[:, 1]
     eps_c = 1e-6
-    g = np.clip(g, trim, 1 - trim)
+    g = np.clip(g, trim, 1 - trim); Kc = np.clip(Kc, trim, 1.0)
     Q0 = np.clip(Q0, eps_c, 1 - eps_c); Q1 = np.clip(Q1, eps_c, 1 - eps_c)
     QA = np.where(A == 1, Q1, Q0)
+    cw = D / Kc                                         # censoring weight (1 when uncensored)
     H = A / g - (1 - A) / (1 - g)                       # clever covariate
-    # targeting: 1-D Newton for the fluctuation eps (logistic, offset logit(QA))
+    # targeting: 1-D Newton for the fluctuation eps (logistic, offset logit(QA)), IPCW-weighted
     off = logit(QA); eps = 0.0
     for _ in range(100):
         p = expit(off + eps * H)
-        score = np.sum(H * (Y - p)); info = np.sum(H * H * p * (1 - p))
+        score = np.sum(cw * H * (Y - p)); info = np.sum(cw * H * H * p * (1 - p))
         if info < 1e-12:
             break
         step = score / info; eps += step
@@ -89,9 +95,10 @@ def crossfit_tmle(X, A, Y, folds, seed, trim=0.01):
     Q0s = expit(logit(Q0) - eps * (1.0 / (1 - g)))
     QAs = expit(off + eps * H)
     keep = (g > trim) & (g < 1 - trim)
-    psi = (Q1s - Q0s) + H * (Y - QAs)                  # efficient influence pseudo-outcome
+    psi = (Q1s - Q0s) + cw * H * (Y - QAs)             # efficient influence pseudo-outcome
     w = np.where(A == 1, 1.0 / g, 1.0 / (1 - g))
     ess = (w[keep].sum() ** 2) / np.sum(w[keep] ** 2)
     diag = {"e_min": float(g.min()), "e_max": float(g.max()),
-            "frac_trimmed": float((~keep).mean()), "ess": float(ess), "n": int(keep.sum())}
+            "frac_trimmed": float((~keep).mean()), "ess": float(ess), "n": int(keep.sum()),
+            "frac_censored": float((D == 0).mean())}
     return psi, keep, diag

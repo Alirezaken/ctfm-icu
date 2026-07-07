@@ -23,9 +23,10 @@ from src.stats import cluster_bootstrap_indices, bootstrap_summary
 
 
 def _bias_reduction(cfg, cohort, ref, seed, folds, nboot, pool_kwargs, estimator,
-                    image_source="images"):
+                    image_source="images", horizon=None):
     A = (cohort["arm"] == "active").to_numpy().astype(int)
     Y = cohort["outcome"].to_numpy().astype(int)
+    D = features.observed_at_horizon(cfg, cohort, horizon) if horizon else None  # §4 IPCW, like the primary
     S = features.structured_at_t0(cfg, cohort).to_numpy(dtype=float)
     Ximg = features.pool_embeddings(cfg, cohort, image_source, **pool_kwargs)
     Xnote = features.pool_embeddings(cfg, cohort, "notes", "notes_all", **pool_kwargs)
@@ -36,7 +37,7 @@ def _bias_reduction(cfg, cohort, ref, seed, folds, nboot, pool_kwargs, estimator
     boot = list(cluster_bootstrap_indices(cohort["subject_id"].to_numpy(), nboot, seed))
     out = {}
     for name, Xc in [("structured", S), ("full", np.hstack([S, Xnote, Ximg]))]:
-        psi, keep, _ = est(Xc, A, Y, folds, seed)
+        psi, keep, _ = est(Xc, A, Y, folds, seed, D=D)
         pt = float(psi[keep].mean() * 100)
         bt = np.array([psi[b][keep[b]].mean() * 100 for b in boot])
         out[name] = (pt, bt)
@@ -69,6 +70,7 @@ def run(cfg, force: bool = False):
         if not ref or ref.get("risk_difference") is None:
             continue
         ref_rd = ref["risk_difference"]
+        horizon = int(cfg.get(f"interventions.{iv}.horizon_days"))
         cohort = pd.read_parquet(pq)
         cohort = cohort[cohort["all_modality"] & cohort["arm"].notna()].reset_index(drop=True)
         if cohort["arm"].nunique() < 2:
@@ -76,7 +78,7 @@ def run(cfg, force: bool = False):
         t0 = time.time()
         for swap, pool_kwargs, estimator, image_source in swaps:
             est = _bias_reduction(cfg, cohort, ref_rd, seed, folds, nboot,
-                                  pool_kwargs, estimator, image_source)
+                                  pool_kwargs, estimator, image_source, horizon=horizon)
             rows.append({"intervention": iv, "swap": swap,
                          **est.as_row("structured_to_full_bias_reduction_")})
         if not have_alt_encoder:

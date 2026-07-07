@@ -134,10 +134,27 @@ def build_manifest(cfg) -> int:
     add("encoder.text", cfg.get("text.encoder"))
     add("encoder.text.max_tokens", cfg.get("text.max_tokens"))
     add("encoder.image_alt", cfg.get("robustness_swaps.encoder_alt"))
-    # pooling / window / bands
+    # robustness swaps (§7.8): all four, not just the encoder
+    add("robustness.estimator_alt", cfg.get("robustness_swaps.estimator_alt"))
+    add("robustness.pooling_alt", cfg.get("robustness_swaps.pooling_alt"))
+    add("robustness.look_back_window_alt_hours", cfg.get("robustness_swaps.look_back_window_alt_hours"))
+    # pooling / window / bands / policies (§8)
     add("pooling.rule", cfg.get("pooling.rule"))
     add("look_back_window_hours", cfg.get("pooling.look_back_window_hours"))
     add("age_bands", cfg.get("demographics.age_bands"))
+    add("embedding_reduction", cfg.get("estimator.embedding_reduction"))
+    add("frontal_view_filter", "PA or AP* (lateral dropped)")
+    add("label_policy", "positive=1; negative/not-mentioned=0; uncertain dropped")
+    # intervention + RCT-reference definitions (§8)
+    for iv, spec in (cfg.get("interventions") or {}).items():
+        add(f"intervention.{iv}.role", spec.get("role"))
+        add(f"intervention.{iv}.outcome", spec.get("outcome"))
+        add(f"intervention.{iv}.horizon_days", spec.get("horizon_days"))
+        add(f"intervention.{iv}.arms", spec.get("arms"))
+        ref = spec.get("rct_reference") or {}
+        add(f"intervention.{iv}.rct_reference",
+            f"{ref.get('source')}: RD={ref.get('risk_difference')} CI={ref.get('ci')} "
+            f"@{ref.get('horizon_days')}d")
     # dataset versions (§1, pinned in config)
     for k, v in (cfg.get("dataset_versions") or {}).items():
         add(f"dataset_version.{k}", v)

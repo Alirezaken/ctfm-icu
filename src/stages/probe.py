@@ -59,8 +59,8 @@ def _binary(series):
     return y
 
 
-def _mimic_image_probe(cfg):
-    label = cfg.get("interventions.fluids_sepsis.imaging_confounder_label", "edema")
+def _mimic_image_probe(cfg, intervention="fluids_sepsis"):
+    label = cfg.get(f"interventions.{intervention}.imaging_confounder_label", "edema")
     idx, V = ev.load_embeddings(cfg, "images")
     cxr = ev.link(cfg, "cxr_studies")[["study_id", label, "split"]]
     df = idx.merge(cxr, on="study_id", how="left").reset_index(drop=True)
@@ -122,7 +122,7 @@ def _external_gates(cfg):
 def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
     cfg.require(f"interventions.{intervention}.imaging_confounder_label")
     log(f"probe[{intervention}]: MIMIC validity gate + external quality gate ...")
-    rows = _mimic_image_probe(cfg) + _external_gates(cfg)
+    rows = _mimic_image_probe(cfg, intervention) + _external_gates(cfg)
 
     # rewrite probe.csv from scratch (idempotent)
     p = cfg.storage("results", "probe.csv")
