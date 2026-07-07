@@ -15,6 +15,11 @@ wget-log*
 __pycache__/
 *.pyc
 
+# --- SLURM jobs & run scripts (machine-specific, not part of the code) ---
+/slurm/
+*.sbatch
+*.sh
+
 # --- SLURM logs & scratch ---
 /logs/
 

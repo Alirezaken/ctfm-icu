@@ -30,8 +30,10 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as pads
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import MIMIC_DIR as MIMIC, EVENT_DIR as OUT
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src import cfg as _cfg; _C = _cfg.load()
+MIMIC = str(_C.input("mimic_dir"))
+OUT   = str(_C.input("event_stream_raw"))
 
 # unified output columns
 COLS = ["subject_id", "hadm_id", "stay_id", "time", "modality",

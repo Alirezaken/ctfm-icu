@@ -25,8 +25,10 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as pads
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import EVENT_DIR, EVENT_CLEAN
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src import cfg as _cfg; _C = _cfg.load()
+EVENT_DIR   = str(_C.input("event_stream_raw"))
+EVENT_CLEAN = str(_C.input("event_stream"))
 
 # curated physiological ranges by itemid (lo, hi)
 RANGES = {

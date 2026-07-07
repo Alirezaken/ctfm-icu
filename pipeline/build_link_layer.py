@@ -22,8 +22,13 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import MIMIC_DIR as MIMIC, ED_DIR as ED, CXR_MASTER as CXR, LINK_DIR as OUT, LABELS
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src import cfg as _cfg; _C = _cfg.load()
+MIMIC  = str(_C.input("mimic_dir"))
+ED     = str(_C.input("ed_dir"))
+CXR    = str(_C.input("cxr_master"))
+OUT    = str(_C.input("link_dir"))
+LABELS = list(_C.get("chexpert_labels"))
 
 os.makedirs(OUT, exist_ok=True)
 

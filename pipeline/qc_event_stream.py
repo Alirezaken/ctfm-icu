@@ -17,8 +17,12 @@ import sys
 import pandas as pd
 import pyarrow.dataset as ds
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import EVENT_DIR, EVENT_CLEAN, MIMIC_DIR, DATA_DIR
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src import cfg as _cfg; _C = _cfg.load()
+MIMIC_DIR   = str(_C.input("mimic_dir"))
+DATA_DIR    = str(_C.input("data_dir"))
+EVENT_DIR   = str(_C.input("event_stream_raw"))
+EVENT_CLEAN = str(_C.input("event_stream"))
 
 # `qc_event_stream.py clean` -> QC the cleaned copy; default -> QC the raw stream
 _CLEAN = len(sys.argv) > 1 and sys.argv[1] == "clean"
