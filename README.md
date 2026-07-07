@@ -11,7 +11,7 @@ reduce confounding bias beyond what structured data alone can achieve?
 The pipeline emulates each intervention as a target trial inside MIMIC-IV,
 estimates the effect under six covariate adjustment conditions (none →
 structured → notes → imaging → all three → expert-curated), and compares
-each estimate to the corresponding RCT risk difference. Effect measure is
+each estimate to the corresponding RCT risk difference. The effect measure is
 the risk difference at the trial horizon, in percentage points.
 
 **Interventions and reference trials**
@@ -147,10 +147,4 @@ never inside the repository.
 - **Checkpoint and resume.** Every stage writes progress markers so
   interrupted cluster jobs resume rather than restart.
 
-## Output
 
-Ten result files under `paths.storage_root/results/`, all in CSV:
-
-`effects.csv` · `dissociation.csv` · `decomposition.csv` · `controls.csv` ·
-`probe.csv` · `cohorts.csv` · `demographics.csv` · `robustness.csv` ·
-`comparisons.csv` · `manifest.csv`
