@@ -67,7 +67,7 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
     Sframe = features.structured_at_t0(cfg, cohort)
     S = Sframe.to_numpy(dtype=float)
     Ximg = features.pool_embeddings(cfg, cohort, "images")
-    Xnote = features.pool_embeddings(cfg, cohort, "notes", "notes_all")
+    Xnote = features.pool_embeddings(cfg, cohort, "notes", "notes_clinical")   # B1: notes_clinical is primary
     # fix-variant only: compress embeddings so they don't break propensity overlap
     if cfg.reduction != "none":
         Ximg = reduce.apply(Ximg, cfg.reduction, A, Y, folds, seed, cfg.pca_components)
@@ -83,8 +83,10 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
     }
     # design_based (§5): expert-curated confounder set (no embeddings)
     exp_names = cfg.get(f"interventions.{intervention}.expert_confounders") or []
+    db_frame = None
     if exp_names:
-        conditions["design_based"] = features.expert_features(cfg, cohort, exp_names).to_numpy(dtype=float)
+        db_frame = features.expert_features(cfg, cohort, exp_names)
+        conditions["design_based"] = db_frame.to_numpy(dtype=float)
 
     # ---- shared bootstrap indices (patient-level, reused across conditions) ----
     nboot = int(cfg.get("bootstrap.n_resamples", 10000))
@@ -149,6 +151,15 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
                              "arm": "", "value": mde, "support_count": int(keep_by_cond["structured"].sum())})
             log(f"  minimum detectable RD (structured, 80% power): {mde:.2f} pp")
 
+    # ---- B4: design_based confounder completeness (extracted / named) ----
+    if exp_names:
+        extracted = db_frame.shape[1] if db_frame is not None else 0
+        coh_rows.append({"intervention": intervention, "section": "design_based",
+                         "metric": "expert_confounders_extracted_over_named", "stratum": "",
+                         "arm": "", "value": f"{extracted}/{len(exp_names)}",
+                         "support_count": len(cohort)})
+        log(f"  design_based completeness: {extracted}/{len(exp_names)} named confounders extracted")
+
     # ---- §4 censoring diagnostic (IPCW): fraction with unknown status at horizon ----
     frac_cens = float((D_obs == 0).mean())
     coh_rows.append({"intervention": intervention, "section": "censoring",
@@ -182,14 +193,15 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
                              "metric": metric, "stratum": stratum, "arm": "",
                              "value": val, "support_count": int(len(grp))})
 
-    # notes_clinical (discharge-only) sensitivity conditions for the decomposition
-    # (§6.3, decision 2). Saved to the boot file only; not primary effect rows.
-    Xnote_c = features.pool_embeddings(cfg, cohort, "notes", "notes_clinical")
+    # notes_all (radiology-inclusive) conditions for the decomposition only (§6.3):
+    # primary is notes_clinical (B1); notes_all is the second decomposition variant.
+    # Saved to the boot file only; not primary effect rows.
+    Xnote_a = features.pool_embeddings(cfg, cohort, "notes", "notes_all")
     if cfg.reduction != "none":
-        Xnote_c = reduce.apply(Xnote_c, cfg.reduction, A, Y, folds, seed, cfg.pca_components)
-    for cname, Xc in [("plus_notes_clinical", np.hstack([S, Xnote_c])),
-                      ("full_clinical", np.hstack([S, Xnote_c, Ximg]))]:
-        cpsi, ckeep, _ = aipw.crossfit_aipw(Xc, A, Y, folds, seed)
+        Xnote_a = reduce.apply(Xnote_a, cfg.reduction, A, Y, folds, seed, cfg.pca_components)
+    for cname, Xc in [("plus_notes_all", np.hstack([S, Xnote_a])),
+                      ("full_all", np.hstack([S, Xnote_a, Ximg]))]:
+        cpsi, ckeep, _ = aipw.crossfit_aipw(Xc, A, Y, folds, seed, D=D_obs)
         boot_by_cond[cname] = np.asarray([cpsi[b][ckeep[b]].mean() * 100 for b in boot])
         point_by_cond[cname] = float(cpsi[ckeep].mean() * 100)
 
@@ -211,7 +223,7 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
         sS = features.structured_at_t0(cfg, sub).to_numpy(dtype=float)
         scond = {"naive": np.ones((len(sY), 1)), "structured": sS}
         if "plus_notes" in names:
-            sN = features.pool_embeddings(cfg, sub, "notes", "notes_all")
+            sN = features.pool_embeddings(cfg, sub, "notes", "notes_clinical")   # B1: notes_clinical primary
             if cfg.reduction != "none":
                 sN = reduce.apply(sN, cfg.reduction, sA, sY, folds, seed, cfg.pca_components)
             scond["plus_notes"] = np.hstack([sS, sN])
@@ -253,7 +265,7 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
     _reset(cfg, "effects.csv", intervention)
     _reset(cfg, "controls.csv", intervention)
     _reset(cfg, "cohorts.csv", intervention,
-           section=["overlap_ess", "mde", "balance", "missingness", "censoring"])
+           section=["overlap_ess", "mde", "balance", "missingness", "censoring", "design_based"])
     R.append_rows(cfg, "effects.csv", eff_rows)
     R.append_rows(cfg, "controls.csv", ctrl_rows)
     R.append_rows(cfg, "cohorts.csv", coh_rows)

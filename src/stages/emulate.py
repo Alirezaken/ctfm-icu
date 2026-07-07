@@ -376,11 +376,15 @@ def _outcome_and_gate(cfg, intervention, cohort, consort):
     has_rad = _pre_t0_subjects("radiology.csv.gz")
 
     cohort["has_pre_t0_cxr"] = cohort["subject_id"].isin(has_cxr)
-    cohort["has_pre_t0_note"] = cohort["subject_id"].isin(has_disch | has_rad)   # primary
-    cohort["has_pre_t0_disch_note"] = cohort["subject_id"].isin(has_disch)       # sensitivity
-    cohort["all_modality"] = cohort["has_pre_t0_cxr"] & cohort["has_pre_t0_note"]
+    cohort["has_pre_t0_note"] = cohort["subject_id"].isin(has_disch)               # D2/B1: discharge note = primary gate
+    cohort["has_pre_t0_note_incl_rad"] = cohort["subject_id"].isin(has_disch | has_rad)  # relaxed (sensitivity)
+    cohort["has_pre_t0_disch_note"] = cohort["subject_id"].isin(has_disch)
+    cohort["all_modality"] = cohort["has_pre_t0_cxr"] & cohort["has_pre_t0_note"]   # requires a discharge note
+    # D2: radiology-only patients (pass the relaxed gate but have no discharge note)
+    rad_only = int((cohort["has_pre_t0_note_incl_rad"] & ~cohort["has_pre_t0_note"]).sum())
     consort.append(("with_pre_t0_frontal_cxr", int(cohort["has_pre_t0_cxr"].sum())))
-    consort.append(("with_pre_t0_note_incl_radiology", int(cohort["has_pre_t0_note"].sum())))
+    consort.append(("with_pre_t0_discharge_note", int(cohort["has_pre_t0_note"].sum())))
+    consort.append(("radiology_only_note_excluded", rad_only))
     consort.append(("all_modality_cohort", int(cohort["all_modality"].sum())))
     consort.append(("all_modality_deaths", int(cohort.loc[cohort["all_modality"], "outcome"].sum())))
     return cohort, consort

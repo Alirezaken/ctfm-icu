@@ -80,9 +80,10 @@ def run(cfg, force: bool = False):
                          "p_raw": _p_two_sided(red_bt), "p_fdr": None})
 
         # --- decomposition: marginal + complementary, notes & imaging, BOTH note
-        #     variants (§6.3): 'all' (radiology-inclusive, primary) and 'clinical'.
-        for variant, pn, fu in [("all", "plus_notes", "full"),
-                                ("clinical", "plus_notes_clinical", "full_clinical")]:
+        #     variants (§6.3): 'clinical' (radiology-excluded, primary per B1) from the
+        #     headline plus_notes/full, and 'all' (radiology-inclusive) from _all.
+        for variant, pn, fu in [("clinical", "plus_notes", "full"),
+                                ("all", "plus_notes_all", "full_all")]:
             if not ({pn, "plus_imaging_only", fu} <= set(bt)):
                 continue
             for mod, own, other in [("notes", pn, "plus_imaging_only"),
@@ -102,6 +103,32 @@ def run(cfg, force: bool = False):
                          "intervention": iv, "stratum": "",
                          "test": "cluster_bootstrap", "statistic": round(pt[cond] - ref, 3),
                          "p_raw": _p_two_sided(diff_bt), "p_fdr": None})
+
+        # --- C6: full vs design_based (the paper's expert baseline) ---
+        if {"full", "design_based"} <= set(bt):
+            dd = np.asarray(bt["full"]) - np.asarray(bt["design_based"])
+            comp.append({"comparison": "full_vs_design_based", "intervention": iv,
+                         "stratum": "", "test": "cluster_bootstrap",
+                         "statistic": round(pt["full"] - pt["design_based"], 3),
+                         "p_raw": _p_two_sided(dd), "p_fdr": None})
+
+    # --- C6: subgroup-difference p-values (full condition), from demographics boots ---
+    for df_ in sorted(results_dir.glob("_demoboot_*.npz")):
+        iv = df_.name[len("_demoboot_"):-len(".npz")]
+        b = np.load(df_, allow_pickle=True)
+        by_type = {}
+        for key in b.files:
+            stype, sname = key.split("|", 1)
+            by_type.setdefault(stype, []).append((sname, b[key]))
+        for stype, levels in by_type.items():
+            if len(levels) < 2:
+                continue
+            (n0, b0), (n1, b1) = levels[0], levels[-1]     # sex F vs M; age first vs last band
+            diff = np.asarray(b1) - np.asarray(b0)
+            comp.append({"comparison": f"subgroup_diff[{stype}:{n1}-{n0}]", "intervention": iv,
+                         "stratum": stype, "test": "cluster_bootstrap",
+                         "statistic": round(float(b1.mean() - b0.mean()), 3),
+                         "p_raw": _p_two_sided(diff), "p_fdr": None})
 
     # BH-FDR across the whole comparisons family (§8 Kind C)
     if comp:

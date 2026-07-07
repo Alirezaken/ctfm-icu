@@ -43,7 +43,7 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
 
     S = features.structured_at_t0(cfg, cohort).to_numpy(dtype=float)
     Ximg = features.pool_embeddings(cfg, cohort, "images")
-    Xnote = features.pool_embeddings(cfg, cohort, "notes", "notes_all")
+    Xnote = features.pool_embeddings(cfg, cohort, "notes", "notes_clinical")   # B1: notes_clinical primary
     if cfg.reduction != "none":
         Ximg = reduce.apply(Ximg, cfg.reduction, A, Y, folds, seed, cfg.pca_components)
         Xnote = reduce.apply(Xnote, cfg.reduction, A, Y, folds, seed, cfg.pca_components)
@@ -61,6 +61,7 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
             subgroups.append(("age_band", band, (age > lo) & (age <= hi)))
 
     rows = []
+    demo_boot = {}            # subgroup -> full-condition bootstrap reps, for §7.9 subgroup-difference p-values
     for stype, sname, mask in subgroups:
         n = int(mask.sum())
         a, y = A[mask], Y[mask]
@@ -103,8 +104,14 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
                          "subgroup": sname, "condition": cond,
                          **eff.as_row("effect_"), **br.as_row("bias_reduction_"),
                          "support_count": n, "undefined": False})
+            if cond == "full":
+                demo_boot[f"{stype}|{sname}"] = bt
         log(f"  {stype}={sname}: n={n} structured RD={pv['structured'][0]:.1f} "
             f"full RD={pv['full'][0]:.1f}")
+
+    # persist full-condition subgroup bootstraps for the §7.9 subgroup-difference p-values
+    if demo_boot:
+        np.savez(cfg.storage("results", f"_demoboot_{intervention}.npz"), **demo_boot)
 
     _reset(cfg, "demographics.csv", intervention)
     R.append_rows(cfg, "demographics.csv", rows)

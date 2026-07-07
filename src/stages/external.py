@@ -252,13 +252,16 @@ def _one(cfg, intervention, spine, aps, seed, folds, nboot):
     if len(coh) < 50:
         log(f"  {intervention}: eICU cohort too small (n={len(coh)}); skip"); return None
 
-    # outcome: in-hospital death within horizon of t0 (discharge alive = survived, a
-    # documented eICU convention -- no post-discharge death observed). Censoring
-    # indicator D = disposition known (§4 IPCW); status-unknown patients are weighted out.
-    within = (coh["death_offset"] - coh["t0_offset"]) <= horizon
-    Y = ((coh["died_hosp"] == 1) & within).astype(int).to_numpy()
+    # outcome: in-hospital death within horizon of t0. eICU has no post-discharge
+    # follow-up, so status at the horizon is KNOWN only if the patient (a) died in
+    # hospital within the horizon, or (b) was still in hospital at t0+horizon (stay
+    # reaches it). Discharged alive BEFORE the horizon -> status unknown -> censored
+    # (D=0), handled by IPCW (§4, C5). This avoids counting early discharges as survivors.
+    stay_len = coh["death_offset"] - coh["t0_offset"]        # t0 -> hospital discharge (min)
+    died_within = (coh["died_hosp"] == 1) & (stay_len <= horizon)
+    Y = died_within.astype(int).to_numpy()
     A = (coh["arm"] == "active").astype(int).to_numpy()
-    D = coh["disp_known"].astype(int).to_numpy()
+    D = (died_within | (stay_len >= horizon)).astype(int).to_numpy()
     if A.min() == A.max() or Y.sum() < 10 or (A == 0).sum() < 20 or (A == 1).sum() < 20:
         log(f"  {intervention}: eICU arms/events too thin "
             f"(n={len(coh)}, active={A.sum()}, deaths={Y.sum()}); skip"); return None

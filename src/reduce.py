@@ -38,21 +38,25 @@ def apply(X, method: str, A=None, Y=None, folds: int = 5, seed: int = 42, k: int
     - 'none'  : unchanged (raw; documented failure case).
     """
     X = np.asarray(X, dtype=float)
+    # C4: decouple the reduction cross-fit partition from the downstream AIPW one
+    # (which uses `seed`), so the two layers do not share fold assignments (which would
+    # let an AIPW test-fold patient influence a reduction score used as a train feature).
+    red_seed = seed + 10007
     if method == "none" or X.shape[1] <= 1:
         return X
     if method == "pca":
         from sklearn.decomposition import PCA
         from sklearn.preprocessing import StandardScaler
         Xs = StandardScaler().fit_transform(X)
-        return PCA(n_components=min(k, Xs.shape[1]), random_state=seed).fit_transform(Xs)
+        return PCA(n_components=min(k, Xs.shape[1]), random_state=red_seed).fit_transform(Xs)
     if method == "pscore":
         if A is None:
             raise ValueError("pscore reduction needs the treatment vector A")
-        return _crossfit_proba(X, A, folds, seed).reshape(-1, 1)
+        return _crossfit_proba(X, A, folds, red_seed).reshape(-1, 1)
     if method == "score":
         if A is None or Y is None:
             raise ValueError("score reduction needs both A (treatment) and Y (outcome)")
-        ps = _crossfit_proba(X, A, folds, seed)     # propensity score
-        pg = _crossfit_proba(X, Y, folds, seed)     # prognostic score
+        ps = _crossfit_proba(X, A, folds, red_seed)     # propensity score
+        pg = _crossfit_proba(X, Y, folds, red_seed)     # prognostic score
         return np.column_stack([ps, pg])
     raise ValueError(f"unknown reduction method '{method}'")

@@ -42,13 +42,20 @@ def _parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def _run_stage(name: str, cfg, args):
+def _per_intervention(name) -> bool:
+    return "intervention" in stages.get(name).run.__code__.co_varnames
+
+
+def _run_stage(name: str, cfg, args, intervention=None):
     mod = stages.get(name)
     kwargs = {"force": args.force}
+    iv = intervention if intervention is not None else args.intervention
     # per-intervention stages accept --intervention
-    if args.intervention is not None and "intervention" in mod.run.__code__.co_varnames:
-        kwargs["intervention"] = args.intervention
-    log(f"=== stage: {name} ===")
+    if iv is not None and "intervention" in mod.run.__code__.co_varnames:
+        kwargs["intervention"] = iv
+        log(f"=== stage: {name} [{iv}] ===")
+    else:
+        log(f"=== stage: {name} ===")
     mod.run(cfg, **kwargs)
 
 
@@ -76,8 +83,15 @@ def main(argv=None):
         log(f"variant: {args.variant}  reduction={cfg.reduction}  results -> {v['results_dir']}/")
 
     if args.stage == "all":
+        # D1: loop every per-intervention stage over all configured interventions;
+        # run cross-intervention stages (link, extract, robustness, consolidate, ...) once.
+        ivs = list((cfg.get("interventions") or {}).keys()) or [None]
         for s in stages.STAGES:
-            _run_stage(s, cfg, args)
+            if _per_intervention(s) and args.intervention is None:
+                for iv in ivs:
+                    _run_stage(s, cfg, args, intervention=iv)
+            else:
+                _run_stage(s, cfg, args)
         return 0
 
     if args.stage not in stages.STAGES:

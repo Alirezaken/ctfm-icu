@@ -29,7 +29,7 @@ def _bias_reduction(cfg, cohort, ref, seed, folds, nboot, pool_kwargs, estimator
     D = features.observed_at_horizon(cfg, cohort, horizon) if horizon else None  # §4 IPCW, like the primary
     S = features.structured_at_t0(cfg, cohort).to_numpy(dtype=float)
     Ximg = features.pool_embeddings(cfg, cohort, image_source, **pool_kwargs)
-    Xnote = features.pool_embeddings(cfg, cohort, "notes", "notes_all", **pool_kwargs)
+    Xnote = features.pool_embeddings(cfg, cohort, "notes", "notes_clinical", **pool_kwargs)   # B1: notes_clinical primary
     if cfg.reduction != "none":
         Ximg = reduce.apply(Ximg, cfg.reduction, A, Y, folds, seed, cfg.pca_components)
         Xnote = reduce.apply(Xnote, cfg.reduction, A, Y, folds, seed, cfg.pca_components)
