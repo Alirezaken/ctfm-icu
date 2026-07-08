@@ -98,6 +98,16 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
                 continue
             pt, bt = pv[cond]
             eff = bootstrap_summary(pt, bt)
+            # A risk difference and its CI are bounded to [-100, 100] pp. A wider CI is
+            # not "wide", it is meaningless (tiny, non-overlapping subgroup) -> mark
+            # undefined rather than report an impossible interval.
+            if not (-100 <= eff.ci_low <= 100 and -100 <= eff.ci_high <= 100):
+                rows.append({"intervention": intervention, "subgroup_type": stype,
+                             "subgroup": sname, "condition": cond,
+                             "support_count": n, "undefined": True})
+                log(f"  {stype}={sname}/{cond}: CI [{eff.ci_low:.1f},{eff.ci_high:.1f}] "
+                    f"exceeds +/-100pp -> undefined")
+                continue
             br = bootstrap_summary(abs(npt - ref) - abs(pt - ref),
                                    np.abs(nbt - ref) - np.abs(bt - ref))
             rows.append({"intervention": intervention, "subgroup_type": stype,

@@ -17,6 +17,7 @@ import pandas as pd
 
 from src.util import log
 from src import events as ev
+from src import features as F
 from src import results as R
 
 _GATE_AUROC = 0.70
@@ -78,6 +79,33 @@ def _mimic_image_probe(cfg, intervention="fluids_sepsis"):
     return [row]
 
 
+def _mimic_note_probe(cfg, intervention="fluids_sepsis"):
+    """§6.5 / E3 note-side validity: does the pre-t0 note embedding carry the
+    clinician urgency / trajectory-gestalt confounder the paper relies on? Target =
+    horizon mortality (a prognosis/goals-of-care proxy; strictly a FUTURE outcome vs
+    the pre-t0 note, so not circular). notes_clinical (radiology-excluded) embedding,
+    patient-level held-out split. modality='notes'."""
+    import pandas as pd
+    coh = pd.read_parquet(cfg.storage("cohorts", f"{intervention}.parquet"))
+    coh = coh[coh["all_modality"] & coh["arm"].notna()].reset_index(drop=True)
+    Xnote = F.pool_embeddings(cfg, coh, "notes", "notes_clinical")
+    y = coh["outcome"].astype(int).to_numpy()
+    subj = coh["subject_id"].to_numpy()
+    seed = int(cfg.get("run.seed", 42))
+    rng = np.random.default_rng(seed)
+    pats = pd.unique(subj)
+    test = set(rng.choice(pats, size=max(1, int(len(pats) * 0.3)), replace=False))
+    te = np.array([s in test for s in subj]); tr = ~te
+    if y[tr].sum() < 20 or y[te].sum() < 10 or y[tr].sum() == 0:
+        log("  MIMIC note probe: too few outcome events; skip"); return []
+    log(f"  MIMIC note 'mortality_prognosis': train={tr.sum():,} test={te.sum():,} pos_rate={y[te].mean():.3f}")
+    row, auroc = _eval_probe(Xnote[tr], y[tr], Xnote[te], y[te], subj[te], seed,
+                             "notes", "mortality_prognosis")
+    if auroc / 100 < _GATE_AUROC:
+        log(f"  note probe: AUROC {auroc:.1f} < {_GATE_AUROC*100:.0f} -- note channel weak for prognosis.")
+    return [row]
+
+
 def _external_gates(cfg):
     qg = cfg.get("quality_gate")
     if not qg:
@@ -120,9 +148,13 @@ def _external_gates(cfg):
 
 
 def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
-    cfg.require(f"interventions.{intervention}.imaging_confounder_label")
+    # imaging_confounder_label is only defined for imaging interventions (fluids/prone);
+    # the image probe defaults to edema and the note probe/external gates run regardless,
+    # so this stage must not hard-require it (rrt/transfusion have no imaging confounder).
     log(f"probe[{intervention}]: MIMIC validity gate + external quality gate ...")
-    rows = _mimic_image_probe(cfg, intervention) + _external_gates(cfg)
+    rows = (_mimic_image_probe(cfg, intervention)
+            + _mimic_note_probe(cfg, intervention)
+            + _external_gates(cfg))
 
     # rewrite probe.csv from scratch (idempotent)
     p = cfg.storage("results", "probe.csv")

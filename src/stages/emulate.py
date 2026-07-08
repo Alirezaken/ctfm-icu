@@ -51,6 +51,9 @@ POSITION_ITEM = 224093      # chart Position (value_txt e.g. "Prone")
 CREAT_ITEM = 50912
 K_ITEM = 50971
 PH_ITEM = 50820
+BUN_ITEM = 51006            # lab BUN (uremia exclusion)
+URINE_ITEMS = [226559, 226560, 226561, 226584, 226563, 226564, 226565,
+               226567, 226557, 226558, 227488, 227489]   # outputevents urine output
 RRT_PROC = [225802]         # procedureevents Dialysis - CRRT
 DIALYSIS_CHART = [225126]   # chart "Dialysis patient"
 HB_ITEM = 51222
@@ -185,12 +188,16 @@ def _build_fluids_sepsis(cfg):
     icu_elig["crystalloid_24h_post_t0"] = icu_elig["crystalloid_24h_post_t0"].fillna(0.0)
     icu_elig["mlkg_24h"] = icu_elig["crystalloid_24h_post_t0"] / icu_elig["weight_kg"]
     # restrictive < 30 ml/kg; if that split is worse than ~70/30, use the cohort median
-    # so overlap is guaranteed (decision 1).
+    # so overlap is guaranteed (decision 1). Disclose which threshold was actually used.
     thr = 30.0
-    if not (0.30 <= float((icu_elig["mlkg_24h"] < thr).mean()) <= 0.70):
+    used_median = not (0.30 <= float((icu_elig["mlkg_24h"] < thr).mean()) <= 0.70)
+    if used_median:
         thr = float(icu_elig["mlkg_24h"].median())
     icu_elig["arm"] = np.where(icu_elig["mlkg_24h"] < thr, "active", "comparator")
-    consort.append(("arm_threshold_mlkg", int(round(thr))))
+    consort.append(("arm_threshold_mlkg", round(thr, 1)))
+    consort.append(("arm_threshold_is_median_fallback", int(used_median)))   # 1 = NOT the pre-spec 30 ml/kg
+    log(f"  fluids arm threshold: {thr:.1f} ml/kg "
+        f"({'MEDIAN FALLBACK - not pre-specified 30' if used_median else 'pre-specified 30'})")
     consort.append(("arm_active_restrictive", int((icu_elig["arm"] == "active").sum())))
     consort.append(("arm_comparator_liberal", int((icu_elig["arm"] == "comparator").sum())))
 
@@ -262,17 +269,39 @@ def _build_rrt_timing(cfg):
     base = crb.groupby("stay_id")["value_num"].min().rename("cr_base")
     cr = crall[(crall["time"] >= crall["intime"]) & (crall["time"] <= crall["outtime"])].sort_values("time")
     cr = cr.merge(base, on="stay_id")
-    stage23 = cr[cr["value_num"] >= 2.0 * cr["cr_base"]]
-    t0 = stage23.groupby("stay_id")["time"].min().rename("t0")
+    # KDIGO stage 2-3 route A: creatinine >= 2x baseline
+    t0_cr = cr[cr["value_num"] >= 2.0 * cr["cr_base"]].groupby("stay_id")["time"].min()
+
+    # KDIGO stage 2-3 route B (issue 5): oliguria, urine output < 0.5 ml/kg/h over the
+    # first 24 h (t0 = intime + 24 h). Adds patients who meet KDIGO by urine, not creatinine.
+    wt = ev.read_modality(cfg, "chart", WEIGHT_ITEMS, columns=["subject_id", "time", "value_num"])
+    wt = wt.merge(icu[["subject_id", "stay_id", "intime", "outtime"]], on="subject_id")
+    wt = wt[(wt["time"] >= wt["intime"] - pd.Timedelta("1D")) & (wt["time"] <= wt["outtime"])]
+    wkg = wt.groupby("stay_id")["value_num"].median()
+    uo = ev.read_modality(cfg, "output", URINE_ITEMS, columns=["subject_id", "time", "value_num"])
+    uo = uo.merge(icu[["subject_id", "stay_id", "intime"]], on="subject_id")
+    uo_win = uo[(uo["time"] >= uo["intime"]) & (uo["time"] <= uo["intime"] + pd.Timedelta("24h"))]
+    agg = uo_win.groupby("stay_id")["value_num"].agg(["sum", "count"])
+    mlkgh = (agg["sum"] / (24.0 * wkg.reindex(agg.index))).dropna()
+    # oliguria only for genuinely MONITORED stays (>=6 charted urine values in 24h ~ q4h),
+    # so sparse/incomplete charting isn't mistaken for low output (issue 5 over-capture guard).
+    oliguric = [s for s in mlkgh.index if mlkgh[s] < 0.5 and agg.loc[s, "count"] >= 6]
+    intime_by_stay = icu.set_index("stay_id")["intime"]
+    t0_uo = intime_by_stay.reindex(oliguric) + pd.Timedelta("24h")
+    # combine both routes: earliest qualifying time per stay
+    t0 = pd.concat([t0_cr, t0_uo.dropna()]).groupby(level=0).min().rename("t0")
     icu = icu.merge(t0, on="stay_id", how="inner")
     consort.append(("aki_kdigo_stage2_3", len(icu)))
+    consort.append(("aki_by_urine_route_only", int(len(set(oliguric) - set(t0_cr.index)))))
 
-    # exclude urgent indication near t0: K>6.5 or pH<7.2 within +/-6h of t0
+    # exclude urgent indication near t0: K>6.5, pH<7.2, or uremia (BUN>100) within +/-6h.
+    # (fluid overload is not operationalized -- needs a reliable fluid-balance series.)
     def _near_t0(itemids, cmp):
         lab = _labs_in_stays(cfg, itemids, icu).merge(icu[["stay_id", "t0"]], on="stay_id")
         lab = lab[(lab["time"] >= lab["t0"] - pd.Timedelta("6h")) & (lab["time"] <= lab["t0"] + pd.Timedelta("6h"))]
         return set(lab.loc[cmp(lab["value_num"]), "stay_id"])
-    urgent = _near_t0([K_ITEM], lambda v: v > 6.5) | _near_t0([PH_ITEM], lambda v: v < 7.2)
+    urgent = (_near_t0([K_ITEM], lambda v: v > 6.5) | _near_t0([PH_ITEM], lambda v: v < 7.2)
+              | _near_t0([BUN_ITEM], lambda v: v > 100))
     icu = icu[~icu["stay_id"].isin(urgent)]
     icu = icu.sort_values("t0").drop_duplicates("subject_id", keep="first")
     consort.append(("no_urgent_indication", len(icu)))
@@ -415,8 +444,11 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
     out.mkdir(parents=True, exist_ok=True)
     cohort.to_parquet(out / f"{intervention}.parquet")
 
-    # CONSORT -> cohorts.csv (long format, §7.6)
+    # CONSORT -> cohorts.csv (long format, §7.6). Reset this intervention's prior
+    # consort rows first so re-runs don't accumulate stale duplicates (idempotent).
     from src import results as R
+    from src.stages.estimate import _reset
+    _reset(cfg, "cohorts.csv", intervention, section="consort")
     rows = [{"intervention": intervention, "section": "consort", "metric": step,
              "stratum": "", "arm": "", "value": cnt, "support_count": cnt}
             for step, cnt in consort]

@@ -98,11 +98,44 @@ def _sofa_lite(sframe, vaso_flag):
     return s
 
 
+# extra design_based confounders (last pre-t0), beyond structured_at_t0
+_EXTRA_LAB = {"pao2": 50821, "ph": 50820}
+_EXTRA_CHART = {"fio2": 223835, "peep": [220339, 224700], "plateau_pressure": 224696,
+                "gcs_eye": 220739, "gcs_verbal": 223900, "gcs_motor": 223901}
+
+
+def _extra_clinical(cfg, cohort) -> pd.DataFrame:
+    """PaO2/FiO2, PEEP, FiO2, plateau pressure, GCS, pH, mechanical-ventilation flag --
+    the design_based confounders (esp. prone's eligibility variables) not in structured_at_t0."""
+    lb = int(cfg.get("pooling.look_back_window_hours", 48))
+    out = pd.DataFrame(index=range(len(cohort)))
+    lab = ev.read_modality(cfg, "lab", list(_EXTRA_LAB.values()),
+                           columns=["subject_id", "time", "type", "value_num"])
+    L = _last_pre_t0(lab, cohort, lb, _EXTRA_LAB).reset_index(drop=True)
+    chart = ev.read_modality(cfg, "chart", [i for v in _EXTRA_CHART.values()
+                                            for i in (v if isinstance(v, list) else [v])],
+                             columns=["subject_id", "time", "type", "value_num"])
+    C = _last_pre_t0(chart, cohort, lb, _EXTRA_CHART).reset_index(drop=True)
+    fio2 = C["fio2"]
+    fio2_frac = fio2.where(fio2 <= 1, fio2 / 100.0)
+    out["pao2"] = L["pao2"].values
+    out["ph"] = L["ph"].values
+    out["fio2"] = fio2.values
+    out["peep"] = C["peep"].values
+    out["plateau_pressure"] = C["plateau_pressure"].values
+    out["pao2_fio2"] = (L["pao2"].values / fio2_frac.replace(0, np.nan).values)
+    out["gcs"] = (C["gcs_eye"] + C["gcs_verbal"] + C["gcs_motor"]).values
+    out["mechanical_ventilation"] = C["peep"].notna().astype(float).values
+    return out
+
+
 def expert_features(cfg, cohort, names) -> pd.DataFrame:
     """The design_based expert-confounder matrix (§5): the intervention's named
-    confounders that we can extract -- structured vitals/labs, a vasopressor flag,
-    a partial SOFA, and comorbidity history. Unmapped names (e.g. infection_source)
-    are omitted (LightGBM handles the reduced set)."""
+    confounders that we can extract -- structured vitals/labs, extra clinical vars
+    (PaO2/FiO2, PEEP, GCS, pH, ...), a vasopressor flag, a partial SOFA, and comorbidity
+    history. Names still unmapped (bmi, hours_since_intubation, infection_source,
+    active_bleeding, urine_output_6h, crystalloid_volume_pre_t0, fluid_balance_cumulative)
+    are omitted and disclosed via the extracted/named ratio in cohorts.csv."""
     lb = int(cfg.get("pooling.look_back_window_hours", 48))
     base = structured_at_t0(cfg, cohort)
     v = ev.read_modality(cfg, "input", _VASO_ITEMS, columns=["subject_id", "time"])
@@ -111,7 +144,9 @@ def expert_features(cfg, cohort, names) -> pd.DataFrame:
     vaso_flag = cohort["subject_id"].isin(set(v["subject_id"])).astype(float).to_numpy()
     base["vasopressor_use"] = vaso_flag
     base["sofa_total"] = _sofa_lite(base, vaso_flag)
-    frame = pd.concat([base.reset_index(drop=True), _comorbidities(cfg, cohort, names)], axis=1)
+    frame = pd.concat([base.reset_index(drop=True),
+                       _extra_clinical(cfg, cohort),
+                       _comorbidities(cfg, cohort, names)], axis=1)
     cols = []
     for n in names:
         c = _EXPERT_MAP.get(n, n)

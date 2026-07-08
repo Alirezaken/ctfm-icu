@@ -193,6 +193,27 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
                              "metric": metric, "stratum": stratum, "arm": "",
                              "value": val, "support_count": int(len(grp))})
 
+    # ---- §7.6 demographic composition by sex and age band, per arm (all-modality) ----
+    import re as _re
+    def _band(a):
+        for b in cfg.get("demographics.age_bands", []):
+            m = _re.match(r"\(([\d.]+),\s*([\d.]+)\]", str(b))
+            if m and float(m.group(1)) < a <= float(m.group(2)):
+                return b
+        return None
+    coh = cohort.copy()
+    coh["_band"] = coh["age_t0"].map(_band)
+    for armname in ["active", "comparator"]:
+        sub = coh[coh["arm"] == armname]
+        for s in cfg.get("demographics.sex_levels", ["F", "M"]):
+            coh_rows.append({"intervention": intervention, "section": "demographic_composition",
+                             "metric": "sex_count", "stratum": s, "arm": armname,
+                             "value": int((sub["sex"] == s).sum()), "support_count": int(len(sub))})
+        for b in cfg.get("demographics.age_bands", []):
+            coh_rows.append({"intervention": intervention, "section": "demographic_composition",
+                             "metric": "age_band_count", "stratum": b, "arm": armname,
+                             "value": int((sub["_band"] == b).sum()), "support_count": int(len(sub))})
+
     # notes_all (radiology-inclusive) conditions for the decomposition only (§6.3):
     # primary is notes_clinical (B1); notes_all is the second decomposition variant.
     # Saved to the boot file only; not primary effect rows.
@@ -265,7 +286,8 @@ def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
     _reset(cfg, "effects.csv", intervention)
     _reset(cfg, "controls.csv", intervention)
     _reset(cfg, "cohorts.csv", intervention,
-           section=["overlap_ess", "mde", "balance", "missingness", "censoring", "design_based"])
+           section=["overlap_ess", "mde", "balance", "missingness", "censoring",
+                    "design_based", "demographic_composition"])
     R.append_rows(cfg, "effects.csv", eff_rows)
     R.append_rows(cfg, "controls.csv", ctrl_rows)
     R.append_rows(cfg, "cohorts.csv", coh_rows)
