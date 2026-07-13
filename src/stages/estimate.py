@@ -1,15 +1,30 @@
-"""§9.7  estimate -- cross-fitted AIPW for every adjustment condition.
+"""estimate -- the main effects. Seven adjustment conditions per intervention.
 
-One estimator everywhere (cross-fitted AIPW, LightGBM nuisance); effect = risk
-difference at the horizon, in percentage points. Conditions on the shared
-all-modality cohort: naive, structured, plus_notes, plus_imaging_only, full
-(design_based pending a fuller confounder extraction -- SOFA/comorbidities).
+  naive            unadjusted
+  expert           clinician-curated structured confounders (the design-based competitor)
+  structured       all extractable structured covariates at t0   <-- THE BASELINE that every
+                                                                     modality condition is
+                                                                     contrasted against
+  struct_img       structured + RAD-DINO chest X-ray embedding
+  struct_radtext   structured + Clinical-Longformer on radiology reports
+  struct_histnote  structured + Clinical-Longformer on prior-admission discharge summaries
+  multimodal       structured + all three
 
-Kind-B reporting (§8): AIPW point + patient-level cluster bootstrap (shared
-indices across conditions, so contrasts are paired). Writes main effects + bias
-vs the RCT reference to effects.csv, and overlap/ESS diagnostics to cohorts.csv.
-negative-control / E-values (controls.csv) are deferred until the negative-control
-outcome (icu_acquired_uti) is built.
+Reported per condition: the ATE (risk difference, percentage points) with a paired
+cluster-bootstrap CI, the influence-function CI as a check, the overlap-weighted ATO, the
+bias against the RCT anchor, the divergence Z, the overlap diagnostics that determine
+whether any of it means anything, and a negative-control effect.
+
+WHY BOTH ATE AND ATO. Adding high-dimensional covariates makes treatment near-deterministic
+for some patients; the propensity mass piles up at the boundaries and the ATE gets fragile
+exactly where this study is asking it to be precise. The ATO weights by e(1-e), is bounded,
+and targets the clinical-equipoise population. Reporting both means the headline null cannot
+be waved away as an artifact of a poorly-supported ATE.
+
+WHY NOT `inside_reference_ci`. STARRT-AKI's published interval is 0.7 pp wide. No
+observational estimate will ever land inside it, so a pass/fail on containment carries no
+information. `divergence_z` accounts for the uncertainty in BOTH the emulation and the
+trial, and is the statistic the emulation-benchmarking literature actually uses.
 """
 from __future__ import annotations
 
@@ -18,278 +33,303 @@ import numpy as np
 import pandas as pd
 
 from src.util import log
-from src import features, aipw, reduce, results as R
-from src.stats import (cluster_bootstrap_indices, bootstrap_summary,
-                       e_value, e_value_ci_limit, influence_function_ci,
-                       minimum_detectable_effect, standardized_mean_differences)
+from src import events as ev
+from src import features as F
+from src import estimator as EST
+from src import results as R
+from src.stats import (cluster_bootstrap_indices, bootstrap_summary, influence_function_ci,
+                       divergence_z, ci_overlaps, minimum_detectable_effect,
+                       standardized_mean_differences, e_value, e_value_ci_limit, round3)
 
 
-def _reset(cfg, fname, intervention, section=None):
-    """Drop this intervention's prior rows from a result file (idempotent re-runs),
-    preserving other interventions and other sections (e.g. emulate's CONSORT)."""
-    p = cfg.storage("results", fname)
-    if not p.exists():
-        return
-    df = pd.read_csv(p)
-    if "intervention" in df.columns:
-        m = df["intervention"] == intervention
-        if section and "section" in df.columns:
-            secs = [section] if isinstance(section, str) else list(section)
-            m = m & (df["section"].isin(secs))
-        df[~m].to_csv(p, index=False)
+def build_conditions(cfg, cohort, S):
+    """The seven design matrices. Embedding blocks are passed RAW; the reduction happens
+    inside the estimator's cross-fitting loop (nested), never here."""
+    n = len(cohort)
+    blocks = {}
+    for mod in ("images", "radtext", "histnote"):
+        blocks[mod] = F.modality_block(cfg, cohort, mod)
+
+    return {
+        "naive":           (np.ones((n, 1)), []),
+        "structured":      (S, []),
+        "struct_img":      (S, [blocks["images"]]),
+        "struct_radtext":  (S, [blocks["radtext"]]),
+        "struct_histnote": (S, [blocks["histnote"]]),
+        "multimodal":      (S, [blocks["images"], blocks["radtext"], blocks["histnote"]]),
+    }, blocks
 
 
-def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
-    cfg.require("estimator.method", "estimator.cross_fitting_folds",
-                "bootstrap.n_resamples", "run.seed",
-                f"interventions.{intervention}.rct_reference.risk_difference")
-    t0 = time.time()
+def run(cfg, force: bool = False, intervention: str = None):
+    names = [intervention] if intervention else list(cfg.get("interventions") or {})
+    for name in names:
+        _run_one(cfg, name)
 
-    full = pd.read_parquet(cfg.storage("cohorts", f"{intervention}.parquet"))
-    full = full[full["arm"].notna()].reset_index(drop=True)   # all eligible (§1 larger cohort)
-    cohort = full[full["all_modality"]].reset_index(drop=True)  # primary shared cohort
+
+def _run_one(cfg, intervention):
+    t_start = time.time()
+    spec = cfg.get(f"interventions.{intervention}")
+    ref = spec["rct_reference"]
+    ref_rd = float(ref["risk_difference"])
+    ref_lo, ref_hi = [float(v) for v in ref["ci"]]
+    ref_src = ref.get("source")
+    horizon = int(spec["horizon_days"])
+
+    full = ev.load_cohorts(cfg, intervention)
+    full = full[full["arm"].notna()].reset_index(drop=True)
+    cohort = full[full["imaged"]].reset_index(drop=True)          # PRIMARY: the imaged cohort
+
     A = (cohort["arm"] == "active").astype(int).to_numpy()
     Y = cohort["outcome"].astype(int).to_numpy()
     subj = cohort["subject_id"].to_numpy()
-    horizon = int(cfg.get(f"interventions.{intervention}.horizon_days"))
-    D_obs = features.observed_at_horizon(cfg, cohort, horizon)   # §4 censoring indicator (IPCW)
-    log(f"estimate[{intervention}]: all-modality cohort n={len(cohort):,} "
-        f"(active={A.sum():,}, comparator={(A==0).sum():,}, deaths={Y.sum():,})")
-    nc = features.negative_control_uti(cfg, cohort)     # §6.4 negative-control outcome
-    baseline_pct = float(Y[A == 0].mean() * 100)        # comparator mortality, for E-values
-    log(f"  negative control (icu_acquired_uti): {int(nc.sum())} positives; "
-        f"baseline mortality {baseline_pct:.1f}%")
+    D = cohort["observed_at_horizon"].astype(int).to_numpy()
 
-    seed = int(cfg.get("run.seed", 42))
-    folds = int(cfg.get("estimator.cross_fitting_folds", 5))
+    log(f"=== estimate[{intervention}] === role={spec.get('role')}")
+    log(f"  imaged cohort n={len(cohort):,}  active={A.sum():,}  "
+        f"comparator={(A==0).sum():,}  deaths={Y.sum():,}  censored={100*(D==0).mean():.1f}%")
 
-    # ---- features (all strictly pre-t0) ----
-    Sframe = features.structured_at_t0(cfg, cohort)
+    if A.sum() < 10 or (A == 0).sum() < 10:
+        log(f"  *** {intervention}: fewer than 10 patients in an arm -- positivity is "
+            f"absent, not merely poor. Estimates will be reported but are NOT interpretable "
+            f"as causal effects. This is the pre-specified positivity_failure_case.")
+
+    Sframe = F.structured_at_t0(cfg, cohort)
     S = Sframe.to_numpy(dtype=float)
-    Ximg = features.pool_embeddings(cfg, cohort, "images")
-    Xnote = features.pool_embeddings(cfg, cohort, "notes", "notes_clinical")   # B1: notes_clinical is primary
-    # fix-variant only: compress embeddings so they don't break propensity overlap
-    if cfg.reduction != "none":
-        Ximg = reduce.apply(Ximg, cfg.reduction, A, Y, folds, seed, cfg.pca_components)
-        Xnote = reduce.apply(Xnote, cfg.reduction, A, Y, folds, seed, cfg.pca_components)
-        log(f"  embedding reduction '{cfg.reduction}': "
-            f"image->{Ximg.shape[1]}d, notes->{Xnote.shape[1]}d")
-    conditions = {
-        "naive": np.ones((len(Y), 1)),
-        "structured": S,
-        "plus_notes": np.hstack([S, Xnote]),
-        "plus_imaging_only": np.hstack([S, Ximg]),
-        "full": np.hstack([S, Xnote, Ximg]),
-    }
-    # design_based (§5): expert-curated confounder set (no embeddings)
-    exp_names = cfg.get(f"interventions.{intervention}.expert_confounders") or []
-    db_frame = None
-    if exp_names:
-        db_frame = features.expert_features(cfg, cohort, exp_names)
-        conditions["design_based"] = db_frame.to_numpy(dtype=float)
+    nc = F.negative_control_uti(cfg, cohort)
+    baseline_pct = float(Y[A == 0].mean() * 100) if (A == 0).any() else np.nan
 
-    # ---- shared bootstrap indices (patient-level, reused across conditions) ----
-    nboot = int(cfg.get("bootstrap.n_resamples", 10000))
-    boot = list(cluster_bootstrap_indices(subj, nboot, seed))
+    conds, blocks = build_conditions(cfg, cohort, S)
 
-    ref = cfg.get(f"interventions.{intervention}.rct_reference")
-    ref_rd = ref["risk_difference"]; ref_lo, ref_hi = ref["ci"]
+    # expert condition, with its extraction completeness recorded
+    exp_names = spec.get("expert_confounders") or []
+    Xexp, n_extracted, n_requested = F.expert_features(cfg, cohort, exp_names)
+    conds["expert"] = (Xexp.to_numpy(dtype=float), [])
 
-    eff_rows, coh_rows, ctrl_rows = [], [], []
-    boot_by_cond, point_by_cond = {}, {}
-    psi_by_cond, keep_by_cond, e_by_cond = {}, {}, {}
-    for name, X in conditions.items():
-        psi, keep, diag = aipw.crossfit_aipw(X, A, Y, folds, seed, D=D_obs)
+    order = cfg.get("conditions")
+    boot = cluster_bootstrap_indices(subj, cfg.nboot, cfg.seed)
+
+    eff_rows, coh_rows = [], []
+    store = {}                       # condition -> everything consolidate/diagnose needs
+
+    ess_structured = None
+    for name in order:
+        if name not in conds:
+            continue
+        X, blks = conds[name]
+        psi, keep, diag = EST.crossfit_aipw(
+            X, A, Y, cfg.folds, cfg.seed, blocks=blks, reduction=cfg.reduction,
+            pca_components=cfg.pca_components, trim=cfg.trim, D=D)
+
         point = float(psi[keep].mean() * 100)
-        bvals = [psi[b][keep[b]].mean() * 100 for b in boot]
-        boot_by_cond[name] = np.asarray(bvals, dtype=float)
-        point_by_cond[name] = point
-        psi_by_cond[name] = psi; keep_by_cond[name] = keep; e_by_cond[name] = diag["e"]
+        bvals = np.array([psi[b][keep[b]].mean() * 100 for b in boot])
         eff = bootstrap_summary(point, bvals)
-        _, if_lo, if_hi = influence_function_ci(psi, keep)      # §8 IF CI, a check
-        bias = bootstrap_summary(point - ref_rd, [v - ref_rd for v in bvals])
-        inside = bool(ref_lo <= point <= ref_hi)
+        _, if_lo, if_hi, se_obs = influence_function_ci(psi, keep)
 
-        # negative control: identical AIPW on the UTI outcome (should be ~null)
-        npsi, nkeep, _ = aipw.crossfit_aipw(X, A, nc, folds, seed)
-        nc_point = float(npsi[nkeep].mean() * 100)
-        nc_eff = bootstrap_summary(nc_point, [npsi[b][nkeep[b]].mean() * 100 for b in boot])
-        ctrl_rows.append({
-            "intervention": intervention, "condition": name,
+        ato_pt = diag["ato"]
+        ato_b = np.array([EST.ato_from_boot(diag["psi_ato"], diag["h_ato"], b) for b in boot])
+        ato = bootstrap_summary(ato_pt, ato_b)
+
+        bias = bootstrap_summary(point - ref_rd, bvals - ref_rd)
+        zdiv = divergence_z(point, se_obs if se_obs else 0.0, ref_rd, (ref_lo, ref_hi))
+        overlap = ci_overlaps((eff.ci_low, eff.ci_high), (ref_lo, ref_hi))
+
+        if name == "structured":
+            ess_structured = diag["ess"]
+
+        # negative control, with the SAME censoring correction as the primary outcome
+        npsi, nkeep, _ = EST.crossfit_aipw(
+            X, A, nc, cfg.folds, cfg.seed, blocks=blks, reduction=cfg.reduction,
+            pca_components=cfg.pca_components, trim=cfg.trim, D=D)
+        nc_pt = float(npsi[nkeep].mean() * 100)
+        nc_eff = bootstrap_summary(nc_pt, [npsi[b][nkeep[b]].mean() * 100 for b in boot])
+
+        store[name] = {"psi": psi, "keep": keep, "boot": bvals, "point": point,
+                       "ess": diag["ess"], "e": diag["e"]}
+
+        eff_rows.append({
+            "intervention": intervention, "condition": name, "cohort": "imaged",
+            "dataset": "mimic", "estimator": "aipw" if name != "naive" else "unadjusted",
+            "reduction": cfg.reduction if blks else "",
+            **eff.as_row("effect_"),
+            "effect_if_ci_low": if_lo, "effect_if_ci_high": if_hi,
+            **ato.as_row("ato_"),
+            "ref_rd": ref_rd, "ref_ci_low": ref_lo, "ref_ci_high": ref_hi,
+            "ref_source": str(ref_src),
+            **bias.as_row("bias_"),
+            "divergence_z": zdiv, "ci_overlaps_rct": overlap,
+            "ci_width": round(eff.ci_high - eff.ci_low, 1),
+            "effective_sample_size": round(diag["ess"]),
+            "ess_ratio_vs_structured": (round(diag["ess"] / ess_structured, 3)
+                                        if ess_structured else ""),
+            "propensity_min": round3(diag["e_min"]), "propensity_max": round3(diag["e_max"]),
+            "frac_trimmed": round3(diag["frac_trimmed"]),
+            "frac_censored": round3(diag["frac_censored"]),
+            "n_analyzed": diag["n"], "n_active": int(A.sum()),
+            "n_comparator": int((A == 0).sum()), "n_events": int(Y.sum()),
+            "min_detectable_effect_pp": minimum_detectable_effect(psi, keep),
+            "expert_confounders_extracted": n_extracted if name == "expert" else "",
+            "expert_confounders_requested": n_requested if name == "expert" else "",
             **nc_eff.as_row("negative_control_"),
             "e_value": e_value(point, baseline_pct),
             "e_value_ci_limit": e_value_ci_limit(eff.ci_low, eff.ci_high, baseline_pct),
         })
 
-        eff_rows.append({
-            "intervention": intervention, "condition": name, "cohort": "all_modality",
-            "dataset": "mimic", "method": "aipw" if name != "naive" else "unadjusted",
-            **eff.as_row("effect_"),
-            "effect_if_ci_low": if_lo, "effect_if_ci_high": if_hi,
-            "ref_rd": ref_rd, "ref_ci_low": ref_lo, "ref_ci_high": ref_hi,
-            **bias.as_row("bias_"), "inside_reference_ci": inside,
-            "ci_width": round(eff.ci_high - eff.ci_low, 1),
-            "effective_sample_size": round(diag["ess"]),
-        })
-        for metric, val in [("ess", round(diag["ess"])),
-                            ("frac_trimmed", round(diag["frac_trimmed"], 4)),
-                            ("propensity_min", round(diag["e_min"], 4)),
-                            ("propensity_max", round(diag["e_max"], 4)),
-                            ("ci_width", round(eff.ci_high - eff.ci_low, 1))]:
-            coh_rows.append({"intervention": intervention, "section": "overlap_ess",
-                             "metric": f"{metric}__{name}", "stratum": "", "arm": "",
-                             "value": val, "support_count": diag["n"]})
-        log(f"  {name:18s} RD={point:6.1f} pp  CI[{eff.ci_low:.1f},{eff.ci_high:.1f}]  "
-            f"bias={point-ref_rd:+.1f}  inside_ref_CI={inside}  ESS={round(diag['ess'])}")
+        log(f"  {name:16s} RD={point:7.1f}  CI[{eff.ci_low:6.1f},{eff.ci_high:6.1f}]  "
+            f"ATO={ato_pt:6.1f}  bias={point-ref_rd:+6.1f}  Z={zdiv}  ESS={round(diag['ess']):5d}")
 
-    # ---- §2/§6 minimum detectable effect (null interventions) ----
-    if cfg.get(f"interventions.{intervention}.rct_reference.target_type") in (None, "null"):
-        mde = minimum_detectable_effect(psi_by_cond["structured"], keep_by_cond["structured"])
-        if mde is not None:
-            coh_rows.append({"intervention": intervention, "section": "mde",
-                             "metric": "min_detectable_rd_pp__structured", "stratum": "",
-                             "arm": "", "value": mde, "support_count": int(keep_by_cond["structured"].sum())})
-            log(f"  minimum detectable RD (structured, 80% power): {mde:.2f} pp")
+    # ---- diagnostics: overlap, balance, missingness, censoring, demographics ----
+    coh_rows += _cohort_diagnostics(cfg, intervention, cohort, full, Sframe, A, Y, D, store)
 
-    # ---- B4: design_based confounder completeness (extracted / named) ----
-    if exp_names:
-        extracted = db_frame.shape[1] if db_frame is not None else 0
-        coh_rows.append({"intervention": intervention, "section": "design_based",
-                         "metric": "expert_confounders_extracted_over_named", "stratum": "",
-                         "arm": "", "value": f"{extracted}/{len(exp_names)}",
-                         "support_count": len(cohort)})
-        log(f"  design_based completeness: {extracted}/{len(exp_names)} named confounders extracted")
+    # ---- larger-scope sensitivity: does the imaging gate itself move `structured`? ----
+    eff_rows += _scope_sensitivity(cfg, intervention, full, cohort, ref_rd, ref_lo, ref_hi,
+                                   ref_src, store, coh_rows)
 
-    # ---- §4 censoring diagnostic (IPCW): fraction with unknown status at horizon ----
-    frac_cens = float((D_obs == 0).mean())
-    coh_rows.append({"intervention": intervention, "section": "censoring",
-                     "metric": f"frac_censored_at_{horizon}d", "stratum": "", "arm": "",
-                     "value": round(frac_cens, 4), "support_count": len(D_obs)})
-    log(f"  censoring at {horizon}d: {frac_cens*100:.2f}% (IPCW; MIMIC dod gives complete follow-up)")
+    # persist everything consolidate/diagnose needs, paired bootstrap included
+    np.savez(cfg.storage("results", f"_boot_{intervention}.npz"),
+             ref_rd=ref_rd, baseline_pct=baseline_pct,
+             conditions=np.array(list(store)),
+             point=np.array([store[c]["point"] for c in store]),
+             ess=np.array([store[c]["ess"] for c in store]),
+             **{c: store[c]["boot"] for c in store})
 
-    # ---- §7.6 covariate balance before/after weighting (structured set) ----
-    e_s = np.clip(e_by_cond["structured"], 1e-6, 1 - 1e-6)
-    w_ipw = np.where(A == 1, 1.0 / e_s, 1.0 / (1.0 - e_s))
-    smd_before = standardized_mean_differences(S, A)
-    smd_after = standardized_mean_differences(S, A, weights=w_ipw)
-    for j, col in enumerate(Sframe.columns):
-        for tag, arr in [("smd_before", smd_before), ("smd_after", smd_after)]:
-            v = arr[j]
-            coh_rows.append({"intervention": intervention, "section": "balance",
-                             "metric": f"{tag}__{col}", "stratum": "", "arm": "",
-                             "value": round(float(v), 3) if np.isfinite(v) else "",
-                             "support_count": len(A)})
+    R.reset_rows(cfg, "effects.csv", intervention=intervention, dataset="mimic")
+    R.reset_rows(cfg, "cohorts.csv", intervention=intervention,
+                 section=["overlap", "balance", "missingness", "censoring",
+                          "demographic_composition", "mde"])
+    R.append_rows(cfg, "effects.csv", eff_rows)
+    R.append_rows(cfg, "cohorts.csv", coh_rows)
+    log(f"estimate[{intervention}] done in {time.time()-t_start:,.0f}s")
 
-    # ---- §6.6 missingness: imaged (all-modality) vs non-imaged eligible patients ----
-    nonimg = full[~full["all_modality"]].reset_index(drop=True)
-    for stratum, grp in [("imaged", cohort), ("non_imaged", nonimg)]:
+
+def _cohort_diagnostics(cfg, iv, cohort, full, Sframe, A, Y, D, store):
+    rows = []
+
+    def add(section, metric, value, stratum="", arm="", support=""):
+        rows.append({"intervention": iv, "section": section, "metric": metric,
+                     "stratum": stratum, "arm": arm, "value": value,
+                     "support_count": support})
+
+    for cond, st in store.items():
+        add("overlap", f"ess__{cond}", round(st["ess"]), support=len(A))
+    add("censoring", "frac_censored_at_horizon", round(float((D == 0).mean()), 4),
+        support=len(D))
+
+    # covariate balance before/after IPW on the structured set
+    if "structured" in store:
+        e = np.clip(store["structured"]["e"], 1e-6, 1 - 1e-6)
+        w = np.where(A == 1, 1 / e, 1 / (1 - e))
+        S = Sframe.to_numpy(dtype=float)
+        for tag, arr in [("smd_before", standardized_mean_differences(S, A)),
+                         ("smd_after", standardized_mean_differences(S, A, weights=w))]:
+            for j, col in enumerate(Sframe.columns):
+                v = arr[j]
+                add("balance", f"{tag}__{col}",
+                    round(float(v), 3) if np.isfinite(v) else "", support=len(A))
+
+    # demographic composition by arm (required by the reporting contract)
+    age = pd.to_numeric(cohort["age_t0"], errors="coerce").to_numpy()
+    for armname, mask in [("active", A == 1), ("comparator", A == 0)]:
+        if not mask.any():
+            continue
+        add("demographic_composition", "n", int(mask.sum()), arm=armname)
+        add("demographic_composition", "age_mean", round(float(np.nanmean(age[mask])), 1),
+            arm=armname)
+        add("demographic_composition", "mortality_frac",
+            round(float(Y[mask].mean()), 3), arm=armname)
+        for s in cfg.get("demographics.sex_levels", ["F", "M"]):
+            n = int(((cohort["sex"] == s).to_numpy() & mask).sum())
+            add("demographic_composition", "sex_count", n, stratum=s, arm=armname)
+        for b in cfg.get("demographics.age_bands", []):
+            lo, hi = _band(b)
+            n = int(((age > lo) & (age <= hi) & mask).sum())
+            add("demographic_composition", "age_band_count", n, stratum=b, arm=armname)
+
+    # missingness: imaged vs non-imaged eligible patients
+    nonimg = full[~full["imaged"]].reset_index(drop=True)
+    for stratum, grp in [("imaged", cohort), ("not_imaged", nonimg)]:
         if not len(grp):
             continue
-        for metric, val in [("age_mean", round(float(grp["age_t0"].mean()), 1)),
-                            ("sex_male_frac", round(float((grp["sex"] == "M").mean()), 3)),
-                            ("mortality_frac", round(float(grp["outcome"].mean()), 3)),
-                            ("active_arm_frac", round(float((grp["arm"] == "active").mean()), 3))]:
-            coh_rows.append({"intervention": intervention, "section": "missingness",
-                             "metric": metric, "stratum": stratum, "arm": "",
-                             "value": val, "support_count": int(len(grp))})
+        for metric, val in [
+            ("n", int(len(grp))),
+            ("age_mean", round(float(pd.to_numeric(grp["age_t0"], errors="coerce").mean()), 1)),
+            ("sex_male_frac", round(float((grp["sex"] == "M").mean()), 3)),
+            ("mortality_frac", round(float(grp["outcome"].mean()), 3)),
+            ("active_arm_frac", round(float((grp["arm"] == "active").mean()), 3)),
+            ("histnote_coverage", round(float(grp["has_pre_t0_histnote"].mean()), 3)),
+        ]:
+            add("missingness", metric, val, stratum=stratum, support=len(grp))
 
-    # ---- §7.6 demographic composition by sex and age band, per arm (all-modality) ----
-    import re as _re
-    def _band(a):
-        for b in cfg.get("demographics.age_bands", []):
-            m = _re.match(r"\(([\d.]+),\s*([\d.]+)\]", str(b))
-            if m and float(m.group(1)) < a <= float(m.group(2)):
-                return b
-        return None
-    coh = cohort.copy()
-    coh["_band"] = coh["age_t0"].map(_band)
-    for armname in ["active", "comparator"]:
-        sub = coh[coh["arm"] == armname]
-        for s in cfg.get("demographics.sex_levels", ["F", "M"]):
-            coh_rows.append({"intervention": intervention, "section": "demographic_composition",
-                             "metric": "sex_count", "stratum": s, "arm": armname,
-                             "value": int((sub["sex"] == s).sum()), "support_count": int(len(sub))})
-        for b in cfg.get("demographics.age_bands", []):
-            coh_rows.append({"intervention": intervention, "section": "demographic_composition",
-                             "metric": "age_band_count", "stratum": b, "arm": armname,
-                             "value": int((sub["_band"] == b).sum()), "support_count": int(len(sub))})
+    if "structured" in store:
+        add("mde", "min_detectable_rd_pp__structured",
+            minimum_detectable_effect(store["structured"]["psi"], store["structured"]["keep"]),
+            support=int(store["structured"]["keep"].sum()))
+    return rows
 
-    # notes_all (radiology-inclusive) conditions for the decomposition only (§6.3):
-    # primary is notes_clinical (B1); notes_all is the second decomposition variant.
-    # Saved to the boot file only; not primary effect rows.
-    Xnote_a = features.pool_embeddings(cfg, cohort, "notes", "notes_all")
-    if cfg.reduction != "none":
-        Xnote_a = reduce.apply(Xnote_a, cfg.reduction, A, Y, folds, seed, cfg.pca_components)
-    for cname, Xc in [("plus_notes_all", np.hstack([S, Xnote_a])),
-                      ("full_all", np.hstack([S, Xnote_a, Ximg]))]:
-        cpsi, ckeep, _ = aipw.crossfit_aipw(Xc, A, Y, folds, seed, D=D_obs)
-        boot_by_cond[cname] = np.asarray([cpsi[b][ckeep[b]].mean() * 100 for b in boot])
-        point_by_cond[cname] = float(cpsi[ckeep].mean() * 100)
 
-    # ---- B (§1): additionally report structured/notes on the LARGER cohort ----
-    # "You may additionally report the structured and notes conditions on the larger
-    # cohort, flagged as such" (§1). Flagged via the `cohort` column; imaging/full
-    # conditions require imaging so they stay on the shared all-modality cohort only.
-    for scope, smask, names in [
-        ("eligible", full["subject_id"].notna().to_numpy(), ["naive", "structured"]),
-        ("has_note", full["has_pre_t0_note"].to_numpy(), ["naive", "structured", "plus_notes"]),
-    ]:
-        sub = full[smask].reset_index(drop=True)
-        if len(sub) <= len(cohort):
-            continue                                   # not actually larger; skip
-        sA = (sub["arm"] == "active").astype(int).to_numpy()
-        sY = sub["outcome"].astype(int).to_numpy()
-        if sA.min() == sA.max():
-            continue
-        sS = features.structured_at_t0(cfg, sub).to_numpy(dtype=float)
-        scond = {"naive": np.ones((len(sY), 1)), "structured": sS}
-        if "plus_notes" in names:
-            sN = features.pool_embeddings(cfg, sub, "notes", "notes_clinical")   # B1: notes_clinical primary
-            if cfg.reduction != "none":
-                sN = reduce.apply(sN, cfg.reduction, sA, sY, folds, seed, cfg.pca_components)
-            scond["plus_notes"] = np.hstack([sS, sN])
-        sboot = list(cluster_bootstrap_indices(sub["subject_id"].to_numpy(), nboot, seed))
-        log(f"  [B §1] scope={scope}: n={len(sub):,} (vs all_modality {len(cohort):,})")
-        for name in names:
-            psi, keep, diag = aipw.crossfit_aipw(scond[name], sA, sY, folds, seed)
-            pt = float(psi[keep].mean() * 100)
-            bt = [psi[b][keep[b]].mean() * 100 for b in sboot]
-            e = bootstrap_summary(pt, bt)
-            _, sif_lo, sif_hi = influence_function_ci(psi, keep)
-            bi = bootstrap_summary(pt - ref_rd, [v - ref_rd for v in bt])
-            eff_rows.append({
-                "intervention": intervention, "condition": name, "cohort": scope,
-                "dataset": "mimic", "method": "aipw" if name != "naive" else "unadjusted",
-                **e.as_row("effect_"), "effect_if_ci_low": sif_lo, "effect_if_ci_high": sif_hi,
-                "ref_rd": ref_rd, "ref_ci_low": ref_lo, "ref_ci_high": ref_hi,
-                **bi.as_row("bias_"), "inside_reference_ci": bool(ref_lo <= pt <= ref_hi),
-                "ci_width": round(e.ci_high - e.ci_low, 1), "effective_sample_size": round(diag["ess"])})
-            coh_rows.append({"intervention": intervention, "section": "overlap_ess",
-                             "metric": f"ess__{name}@{scope}", "stratum": "", "arm": "",
-                             "value": round(diag["ess"]), "support_count": diag["n"]})
-            # §6.6 imaged-subset sensitivity: does restricting to imaged shift `structured`?
-            if name == "structured":
-                shift = round(pt - point_by_cond["structured"], 1)
-                coh_rows.append({"intervention": intervention, "section": "missingness",
-                                 "metric": f"structured_shift_imaged_minus_{scope}", "stratum": "",
-                                 "arm": "", "value": shift, "support_count": len(sub)})
-            log(f"    {scope}/{name}: RD={pt:.1f} ESS={round(diag['ess'])}")
+def _scope_sensitivity(cfg, iv, full, cohort, ref_rd, ref_lo, ref_hi, ref_src, store, coh_rows):
+    """Re-estimate `naive` and `structured` on the FULL eligible cohort (no imaging gate).
 
-    # persist per-condition bootstrap replicates (paired; needed by consolidate for
-    # dissociation/decomposition/comparisons). Not a §7 file -- underscore-prefixed.
-    all_conds = list(boot_by_cond)            # 5 primary + notes_clinical sensitivity pair
-    np.savez(cfg.storage("results", f"_boot_{intervention}.npz"),
-             ref_rd=float(ref_rd), baseline_pct=float(baseline_pct),
-             point=np.array([point_by_cond[c] for c in all_conds]),
-             conditions=np.array(all_conds), **boot_by_cond)
+    This is how we show the imaging gate did not itself select a different causal question.
+    If `structured` shifts materially between `eligible` and `imaged`, the gate is a
+    confounder of the comparison and must be reported as such.
+    """
+    rows = []
+    sub = full.reset_index(drop=True)
+    if len(sub) <= len(cohort):
+        return rows
 
-    _reset(cfg, "effects.csv", intervention)
-    _reset(cfg, "controls.csv", intervention)
-    _reset(cfg, "cohorts.csv", intervention,
-           section=["overlap_ess", "mde", "balance", "missingness", "censoring",
-                    "design_based", "demographic_composition"])
-    R.append_rows(cfg, "effects.csv", eff_rows)
-    R.append_rows(cfg, "controls.csv", ctrl_rows)
-    R.append_rows(cfg, "cohorts.csv", coh_rows)
-    log(f"estimate[{intervention}] done in {time.time()-t0:,.0f}s -> effects.csv, controls.csv, "
-        f"cohorts.csv. reference RD={ref_rd} [{ref_lo},{ref_hi}] pp. design_based deferred.")
+    A = (sub["arm"] == "active").astype(int).to_numpy()
+    Y = sub["outcome"].astype(int).to_numpy()
+    D = sub["observed_at_horizon"].astype(int).to_numpy()
+    if A.min() == A.max():
+        return rows
+
+    S = F.structured_at_t0(cfg, sub).to_numpy(dtype=float)
+    boot = cluster_bootstrap_indices(sub["subject_id"].to_numpy(), cfg.nboot, cfg.seed)
+    log(f"  [scope] eligible n={len(sub):,} (vs imaged {len(cohort):,})")
+
+    for name, X in [("naive", np.ones((len(Y), 1))), ("structured", S)]:
+        psi, keep, diag = EST.crossfit_aipw(X, A, Y, cfg.folds, cfg.seed,
+                                            trim=cfg.trim, D=D)
+        pt = float(psi[keep].mean() * 100)
+        bt = np.array([psi[b][keep[b]].mean() * 100 for b in boot])
+        e = bootstrap_summary(pt, bt)
+        _, if_lo, if_hi, se = influence_function_ci(psi, keep)
+        ato_b = np.array([EST.ato_from_boot(diag["psi_ato"], diag["h_ato"], b) for b in boot])
+        ato = bootstrap_summary(diag["ato"], ato_b)
+        bias = bootstrap_summary(pt - ref_rd, bt - ref_rd)
+
+        rows.append({
+            "intervention": iv, "condition": name, "cohort": "eligible", "dataset": "mimic",
+            "estimator": "aipw" if name != "naive" else "unadjusted", "reduction": "",
+            **e.as_row("effect_"), "effect_if_ci_low": if_lo, "effect_if_ci_high": if_hi,
+            **ato.as_row("ato_"),
+            "ref_rd": ref_rd, "ref_ci_low": ref_lo, "ref_ci_high": ref_hi,
+            "ref_source": str(ref_src),
+            **bias.as_row("bias_"),
+            "divergence_z": divergence_z(pt, se or 0.0, ref_rd, (ref_lo, ref_hi)),
+            "ci_overlaps_rct": ci_overlaps((e.ci_low, e.ci_high), (ref_lo, ref_hi)),
+            "ci_width": round(e.ci_high - e.ci_low, 1),
+            "effective_sample_size": round(diag["ess"]),
+            "propensity_min": round3(diag["e_min"]), "propensity_max": round3(diag["e_max"]),
+            "frac_trimmed": round3(diag["frac_trimmed"]),
+            "frac_censored": round3(diag["frac_censored"]),
+            "n_analyzed": diag["n"], "n_active": int(A.sum()),
+            "n_comparator": int((A == 0).sum()), "n_events": int(Y.sum()),
+            "min_detectable_effect_pp": minimum_detectable_effect(psi, keep),
+        })
+        if name == "structured" and "structured" in store:
+            shift = round(store["structured"]["point"] - pt, 1)
+            coh_rows.append({
+                "intervention": iv, "section": "missingness",
+                "metric": "structured_shift_imaged_minus_eligible", "stratum": "", "arm": "",
+                "value": shift, "support_count": len(sub)})
+            log(f"  [scope] gate shift on `structured`: {shift:+.1f} pp "
+                f"(large => the imaging gate changed the causal question)")
+    return rows
+
+
+def _band(s):
+    import re
+    m = re.match(r"\(([\d.]+),\s*([\d.]+)\]", str(s))
+    return (float(m.group(1)), float(m.group(2))) if m else (-np.inf, np.inf)

@@ -1,28 +1,31 @@
-"""Stage registry. Each stage is a module exposing `run(cfg, force=False)`.
-
-Order matches the run order in ALIREZA_INSTRUCTIONS.md §9. main_causal.py
-dispatches `--stage <name>` here; `--stage all` runs them in this order.
-"""
+"""Stage registry. The run order is the dependency order and main.py enforces it."""
 from importlib import import_module
 
-# name -> module under src.stages, in run order (§9)
+# THE ORDER MATTERS.
+#   emulate must precede extract_embeddings (embedding is scoped to cohort patients)
+#   estimate must precede diagnose          (diagnose reads the ESS the estimator paid)
+#   synthesize must precede diagnose        (diagnose reads the calibration curve)
+#   robustness must precede consolidate     (consolidate reads subgroup rows back)
+#   integrity runs LAST and gates everything
 STAGES = [
-    "link",                # §9.3  build/verify MIMIC-IV intersect MIMIC-CXR linkage
-    "extract_embeddings",  # §9.4  resize+save images, extract frozen image/note vectors
-    "extract_external_cxr",# §3    RAD-DINO embeddings for external CXR sets (quality gate)
-    "extract_images_alt",  # §9.11 BiomedCLIP embeddings (robustness encoder swap)
-    "emulate",             # §9.5  build emulated-trial cohort(s)
-    "probe",               # §9.6  validity probe (gate before estimating)
-    "estimate",            # §9.7  AIPW for all conditions; main effects + controls
-    "demographics",        # §9.10 subgroup re-estimation by sex and age band
-    "robustness",          # §9.11 four swaps (encoder, estimator, window, pooling)
-    "external",            # §9.12 structured + plus_notes rerun on eICU
-    "consolidate",         # §9.13 merge into the 10 result files (§7)
-    "integrity_check",     # §9.14 assert invariants; exactly 10 result files
+    "link",                # verify the link layer
+    "emulate",             # build all four cohorts -> manifests/cohorts.parquet
+    "extract_embeddings",  # the GPU stage: images, radtext, histnote (+ images_alt)
+    "extract_external",    # external CXR sets, for the informativeness replication
+    "estimate",            # the seven adjustment conditions -> effects.csv
+    "synthesize",          # semi-synthetic benchmark -> synthetic.csv
+    "diagnose",            # probes + incremental confounding -> diagnostics.csv
+    "robustness",          # swaps + subgroups -> robustness.csv
+    "external",            # eICU structured replication -> effects.csv
+    "consolidate",         # all paired contrasts -> contrasts.csv, manifest.csv
+    "integrity",           # assert every invariant. FAILS LOUDLY.
 ]
+
+# stages that take --intervention; the rest ignore it
+PER_INTERVENTION = {"emulate", "estimate", "diagnose", "robustness", "external"}
 
 
 def get(name: str):
     if name not in STAGES:
-        raise KeyError(name)
+        raise KeyError(f"unknown stage '{name}'. Known: {', '.join(STAGES)}")
     return import_module(f"src.stages.{name}")

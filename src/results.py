@@ -1,14 +1,33 @@
-"""The 10 result files (§7) -- one exact schema, one writer, in one place.
+"""The SEVEN result files. One exact schema, one writer, defined in one place.
 
-Defines the column layout of every result CSV per §7, with the column "kinds"
-of §8 baked in (Kind A performance / Kind B causal-effect / Kind C statistical),
-so no stage invents its own format. `write_templates` lays down header-only files;
-stages append rows through `append_rows`, which refuses any column not in the
-schema (the mirror of the no-fabrication rule -- structure can't drift silently).
+Consolidated from the previous ten so that every number a reviewer needs to check a claim
+sits next to the claim, and so that Alireza (and Soroosh) can audit the study by reading
+seven files instead of ten cross-referenced ones.
 
-Kind-B quantities expand to five columns: <name>_point (AIPW point estimate),
-_mean, _std, _ci_low, _ci_high (patient-level cluster bootstrap, §8).
-Kind-A metrics expand to four: _mean, _std, _ci_low, _ci_high (percent).
+  effects.csv      every (intervention x condition x cohort x dataset): the risk
+                   difference, its CI, the bias against the RCT anchor, the divergence Z,
+                   the ATO, and the overlap diagnostics that determine whether the number
+                   means anything.
+  diagnostics.csv  the paper's contribution. Per (intervention x modality): the probe
+                   AUROC (is it informative?), dAUC_treat and dAUC_outcome (is it
+                   INCREMENTALLY confounding?), the positivity cost (can we afford it?),
+                   and the decision-rule verdict with a plain-language reason.
+  contrasts.csv    every PAIRED contrast with a p-value and BH-FDR. Bias reductions,
+                   modality decomposition, subgroup differences, multimodal-vs-expert.
+                   The ONLY file with p-values.
+  cohorts.csv      CONSORT, demographics by arm, covariate balance, missingness,
+                   censoring, minimum detectable effects.
+  synthetic.csv    the semi-synthetic calibration sweep. The proof the estimator works
+                   and the null is a fact about the data.
+  robustness.csv   encoder / estimator / window / pooling / reduction / trim swaps, and
+                   the subgroup re-estimations.
+  manifest.csv     full reproducibility record.
+
+Column KINDS are baked into the schema (see stats.py):
+  Kind B (causal)      -> 5 columns: _point _mean _std _ci_low _ci_high   [percentage points]
+  Kind A (performance) -> 4 columns: _mean _std _ci_low _ci_high          [percent]
+  Kind C (statistical) -> 1 column, natural scale, never with a mean/CI
+`append_rows` refuses any column not in the schema, so structure cannot drift silently.
 """
 from __future__ import annotations
 
@@ -18,70 +37,85 @@ from src.util import log
 
 
 def _kb(name: str) -> list[str]:
-    """Kind-B causal-effect quantity -> 5 columns (point + bootstrap summary)."""
+    """Kind-B causal quantity -> 5 columns."""
     return [f"{name}_point", f"{name}_mean", f"{name}_std",
             f"{name}_ci_low", f"{name}_ci_high"]
 
 
 def _ka(name: str) -> list[str]:
-    """Kind-A performance metric -> 4 columns (bootstrap summary, percent)."""
+    """Kind-A performance metric -> 4 columns."""
     return [f"{name}_mean", f"{name}_std", f"{name}_ci_low", f"{name}_ci_high"]
 
 
-# filename -> ordered column list. Keys first, then values.
 SCHEMAS: dict[str, list[str]] = {
-    # 1. main effects (§7.1)
+
+    # ---------------------------------------------------------------- 1
     "effects.csv": (
-        ["intervention", "condition", "cohort", "dataset", "method"]
-        + _kb("effect")
-        + ["effect_if_ci_low", "effect_if_ci_high"]   # §8 influence-function CI, a check
-        + ["ref_rd", "ref_ci_low", "ref_ci_high"]
-        + _kb("bias")
-        + ["inside_reference_ci"]
+        ["intervention", "condition", "cohort", "dataset", "estimator", "reduction"]
+        + _kb("effect")                       # the risk difference (ATE)
+        + ["effect_if_ci_low", "effect_if_ci_high"]        # influence-function CI, a check
+        + _kb("ato")                          # overlap-weighted estimand
+        + ["ref_rd", "ref_ci_low", "ref_ci_high", "ref_source"]
+        + _kb("bias")                         # effect - RCT reference
+        + ["divergence_z",                    # Kind C: replaces inside_reference_ci
+           "ci_overlaps_rct",                 # honest weak compatibility check
+           "ci_width", "effective_sample_size", "ess_ratio_vs_structured",
+           "propensity_min", "propensity_max", "frac_trimmed", "frac_censored",
+           "n_analyzed", "n_active", "n_comparator", "n_events",
+           "min_detectable_effect_pp",
+           "expert_confounders_extracted", "expert_confounders_requested"]
         + _kb("negative_control")
-        + ["ci_width", "effective_sample_size"]
+        + ["e_value", "e_value_ci_limit"]
     ),
-    # 2. specificity grid (§7.2)
-    "dissociation.csv": (
-        ["intervention", "modality"] + _kb("bias_reduction_vs_structured")
+
+    # ---------------------------------------------------------------- 2
+    # THE CONTRIBUTION. One row per (intervention, modality).
+    "diagnostics.csv": (
+        ["intervention", "modality", "check"]
+        # (1) informativeness: does the embedding encode the confounder at all?
+        + _ka("probe_auroc") + _ka("probe_auprc") + ["probe_target", "probe_n_test"]
+        # (2) incremental confounding: is that information NEW, and does it move BOTH channels?
+        + ["auc_treat_structured", "auc_treat_with_modality", "d_auc_treat",
+           "auc_outcome_structured", "auc_outcome_with_modality", "d_auc_outcome",
+           "ici"]
+        # (3) positivity: can we afford it?
+        + ["ess_structured", "ess_with_modality", "positivity_cost"]
+        # the rule
+        + ["add_modality", "reason",
+           "observed_bias_reduction_pp", "predicted_bias_reduction_pp"]
     ),
-    # 3. modality decomposition (§7.3)
-    "decomposition.csv": (
-        ["intervention", "modality", "notes_variant"]
-        + _kb("marginal_bias_reduction") + _kb("complementary_bias_reduction")
+
+    # ---------------------------------------------------------------- 3
+    "contrasts.csv": (
+        ["contrast", "intervention", "modality", "stratum"]
+        + _kb("value")
+        + ["min_detectable_pp",               # Kind C: makes a null decisive
+           "test", "p_raw", "p_fdr"]
     ),
-    # 4. negative controls + sensitivity (§7.4)
-    "controls.csv": (
-        ["intervention", "condition"]
-        + _kb("negative_control")
-        + ["e_value", "e_value_ci_limit"]          # Kind C, natural scale
-    ),
-    # 5. validity probe (§7.5)
-    "probe.csv": (
-        ["modality", "target_confounder"] + _ka("auroc") + _ka("auprc")
-    ),
-    # 6. cohorts / CONSORT / overlap / ESS / MDE / missingness / demographics (§7.6)
-    #    heterogeneous -> long format (one quantity per row)
+
+    # ---------------------------------------------------------------- 4
     "cohorts.csv": [
-        "intervention", "section", "metric", "stratum", "arm",
-        "value", "support_count",
+        "intervention", "section", "metric", "stratum", "arm", "value", "support_count",
     ],
-    # 7. demographics / subgroups (§7.7)
-    "demographics.csv": (
-        ["intervention", "subgroup_type", "subgroup", "condition"]
-        + _kb("effect") + _kb("bias_reduction")
-        + ["support_count", "undefined"]
+
+    # ---------------------------------------------------------------- 5
+    "synthetic.csv": (
+        ["sweep", "gamma", "delta", "redundancy", "replicate",
+         "true_rd_pp", "n", "confounder_r2_on_structured"]
+        + ["rd_structured", "rd_struct_img",
+           "bias_structured", "bias_struct_img", "bias_reduction",
+           "d_auc_treat", "d_auc_outcome", "ici",
+           "ess_structured", "ess_struct_img", "positivity_cost"]
     ),
-    # 8. robustness swaps (§7.8)
+
+    # ---------------------------------------------------------------- 6
     "robustness.csv": (
-        ["intervention", "swap"] + _kb("structured_to_full_bias_reduction")
+        ["intervention", "family", "swap", "condition", "subgroup"]
+        + _kb("value")
+        + ["support_count", "undefined", "note"]
     ),
-    # 9. comparisons -- the ONLY file with p-values (§7.9); no percent, no mean/CI
-    "comparisons.csv": [
-        "comparison", "intervention", "stratum",
-        "test", "statistic", "p_raw", "p_fdr",
-    ],
-    # 10. manifest -- reproducibility key/value (§7.10)
+
+    # ---------------------------------------------------------------- 7
     "manifest.csv": ["key", "value"],
 }
 
@@ -89,8 +123,8 @@ RESULT_FILES = list(SCHEMAS)
 
 
 def write_templates(cfg, force: bool = False) -> list[str]:
-    """Create header-only CSVs for all 10 result files under paths.results.
-    Existing non-empty files are left untouched unless force=True."""
+    """Header-only CSVs for all seven files. Existing non-empty files are left alone
+    unless force=True."""
     out = cfg.storage("results")
     out.mkdir(parents=True, exist_ok=True)
     written = []
@@ -101,87 +135,16 @@ def write_templates(cfg, force: bool = False) -> list[str]:
         with open(p, "w", newline="") as fh:
             csv.writer(fh).writerow(cols)
         written.append(fname)
-    log(f"result templates ready in {out} ({len(written)} written, "
-        f"{len(SCHEMAS) - len(written)} already present)")
+    log(f"result templates ready in {out} "
+        f"({len(written)} written, {len(SCHEMAS) - len(written)} already present)")
     return written
 
 
-def build_manifest(cfg) -> int:
-    """Write manifest.csv from values that are genuinely known now: config
-    settings and installed package versions. Unknown-yet values (wall-clock
-    times, encoder checkpoints once pinned, look-back/age bands once chosen)
-    are written as empty -- never fabricated (§0). Returns row count."""
-    import importlib.metadata as md
-
-    rows: list[tuple[str, str]] = []
-
-    def add(k, v):
-        rows.append((k, "" if v is None else str(v)))
-
-    # reproducibility
-    add("seed", cfg.get("run.seed"))
-    add("bootstrap.n_resamples", cfg.get("bootstrap.n_resamples"))
-    add("bootstrap.unit", cfg.get("bootstrap.unit"))
-    # estimator
-    add("estimator.method", cfg.get("estimator.method"))
-    add("effect_measure", cfg.get("run.effect_measure"))
-    add("effect_scale", cfg.get("run.effect_scale"))
-    add("estimator.cross_fitting_folds", cfg.get("estimator.cross_fitting_folds"))
-    add("estimator.nuisance_model", cfg.get("estimator.nuisance_model"))
-    # encoders
-    add("encoder.image", cfg.get("images.encoder"))
-    add("encoder.image.size", cfg.get("images.size"))
-    add("encoder.text", cfg.get("text.encoder"))
-    add("encoder.text.max_tokens", cfg.get("text.max_tokens"))
-    add("encoder.image_alt", cfg.get("robustness_swaps.encoder_alt"))
-    # robustness swaps (§7.8): all four, not just the encoder
-    add("robustness.estimator_alt", cfg.get("robustness_swaps.estimator_alt"))
-    add("robustness.pooling_alt", cfg.get("robustness_swaps.pooling_alt"))
-    add("robustness.look_back_window_alt_hours", cfg.get("robustness_swaps.look_back_window_alt_hours"))
-    # pooling / window / bands / policies (§8)
-    add("pooling.rule", cfg.get("pooling.rule"))
-    add("look_back_window_hours", cfg.get("pooling.look_back_window_hours"))
-    add("age_bands", cfg.get("demographics.age_bands"))
-    add("embedding_reduction", cfg.get("estimator.embedding_reduction"))
-    add("frontal_view_filter", "PA or AP* (lateral dropped)")
-    add("label_policy", "positive=1; negative/not-mentioned=0; uncertain dropped")
-    # intervention + RCT-reference definitions (§8)
-    for iv, spec in (cfg.get("interventions") or {}).items():
-        add(f"intervention.{iv}.role", spec.get("role"))
-        add(f"intervention.{iv}.outcome", spec.get("outcome"))
-        add(f"intervention.{iv}.horizon_days", spec.get("horizon_days"))
-        add(f"intervention.{iv}.arms", spec.get("arms"))
-        ref = spec.get("rct_reference") or {}
-        add(f"intervention.{iv}.rct_reference",
-            f"{ref.get('source')}: RD={ref.get('risk_difference')} CI={ref.get('ci')} "
-            f"@{ref.get('horizon_days')}d")
-    # dataset versions (§1, pinned in config)
-    for k, v in (cfg.get("dataset_versions") or {}).items():
-        add(f"dataset_version.{k}", v)
-    # package versions of the run environment
-    for pkg in ["numpy", "pandas", "pyarrow", "scipy", "scikit-learn",
-                "lightgbm", "pyyaml"]:
-        try:
-            add(f"pkg.{pkg}", md.version(pkg))
-        except md.PackageNotFoundError:
-            add(f"pkg.{pkg}", None)
-    # wall-clock (filled by the extraction/estimation stages)
-    add("walltime.extract_embeddings_sec", None)
-    add("walltime.estimate_sec", None)
-
-    p = cfg.storage("results", "manifest.csv")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(SCHEMAS["manifest.csv"])
-        w.writerows(rows)
-    return len(rows)
-
-
-def append_rows(cfg, fname: str, rows: list[dict]):
-    """Append rows to a result file, enforcing the schema (no unknown columns)."""
+def append_rows(cfg, fname: str, rows: list):
+    """Append rows, enforcing the schema. An unknown column is an error, not a warning:
+    a silently-dropped column is a silently-lost result."""
     if fname not in SCHEMAS:
-        raise KeyError(f"{fname} is not one of the 10 result files")
+        raise KeyError(f"{fname} is not one of the seven result files")
     cols = SCHEMAS[fname]
     p = cfg.storage("results", fname)
     if not p.exists():
@@ -191,5 +154,118 @@ def append_rows(cfg, fname: str, rows: list[dict]):
         for r in rows:
             unknown = set(r) - set(cols)
             if unknown:
-                raise ValueError(f"{fname}: unknown column(s) {unknown}")
+                raise ValueError(f"{fname}: unknown column(s) {sorted(unknown)}")
             w.writerow({c: r.get(c, "") for c in cols})
+
+
+def reset_rows(cfg, fname: str, **match):
+    """Drop rows matching a set of column==value filters, so a stage can re-run
+    idempotently without wiping other stages' rows from the same file."""
+    import pandas as pd
+    p = cfg.storage("results", fname)
+    if not p.exists():
+        return
+    df = pd.read_csv(p)
+    if not len(df):
+        return
+    m = pd.Series(True, index=df.index)
+    for col, val in match.items():
+        if col not in df.columns:
+            return
+        vals = val if isinstance(val, (list, tuple, set)) else [val]
+        m &= df[col].isin(list(vals))
+    df[~m].to_csv(p, index=False)
+
+
+def build_manifest(cfg) -> int:
+    """The reproducibility record. Everything needed to re-run this study exactly.
+
+    Values that are genuinely unknown at write time are written EMPTY, never invented.
+    """
+    import importlib.metadata as md
+    rows = []
+
+    def add(k, v):
+        rows.append((k, "" if v is None else str(v)))
+
+    add("study", "RCT-anchored audit of multimodal causal adjustment in the ICU")
+    add("seed", cfg.get("run.seed"))
+    add("bootstrap.n_resamples", cfg.get("bootstrap.n_resamples"))
+    add("bootstrap.unit", cfg.get("bootstrap.unit"))
+    add("bootstrap.reuse_indices_across_conditions",
+        cfg.get("bootstrap.reuse_indices_across_conditions"))
+
+    # estimator
+    for k in ["method", "nuisance_model", "cross_fitting_folds", "trim",
+              "embedding_reduction", "reduction_nested", "pca_components", "report_ato"]:
+        add(f"estimator.{k}", cfg.get(f"estimator.{k}"))
+    add("effect_measure", cfg.get("run.effect_measure"))
+    add("effect_scale", cfg.get("run.effect_scale"))
+
+    # modalities: what each channel ACTUALLY is
+    for name in ["images", "radtext", "histnote", "images_alt"]:
+        add(f"modality.{name}.encoder", cfg.get(f"modalities.{name}.encoder"))
+        add(f"modality.{name}.hf_id", cfg.get(f"modalities.{name}.hf_id"))
+        add(f"modality.{name}.source", cfg.get(f"modalities.{name}.source"))
+    add("modality.images.views", cfg.get("modalities.images.views"))
+    add("modality.histnote.caveat", cfg.get("modalities.histnote.note"))
+
+    # pooling / gate
+    add("pooling.rule", cfg.get("pooling.rule"))
+    add("pooling.look_back_window_hours", cfg.get("pooling.look_back_window_hours"))
+    add("cohort.primary_gate", cfg.get("cohort.primary_gate"))
+
+    # diagnostic thresholds
+    for k in ["auc_threshold", "positivity_cost_max", "bootstrap_reps"]:
+        add(f"diagnostic.{k}", cfg.get(f"diagnostic.{k}"))
+
+    # synthetic benchmark
+    for k in ["base_intervention", "gamma_grid", "delta_grid", "replicates",
+              "target_rd_pp", "redundancy_grid"]:
+        add(f"synthetic.{k}", cfg.get(f"synthetic.{k}"))
+
+    # robustness axes (ALL of them, not just the encoder)
+    for k in ["encoder_alt", "estimator_alt", "look_back_window_alt_hours",
+              "pooling_alt", "reduction_alt", "trim_alt"]:
+        add(f"robustness.{k}", cfg.get(f"robustness_swaps.{k}"))
+
+    # demographics
+    add("demographics.age_bands", cfg.get("demographics.age_bands"))
+    add("demographics.min_arm_events", cfg.get("demographics.min_arm_events"))
+
+    # interventions: definition + RCT anchor + how the anchor was derived
+    for iv, spec in (cfg.get("interventions") or {}).items():
+        add(f"intervention.{iv}.role", spec.get("role"))
+        add(f"intervention.{iv}.arms", spec.get("arms"))
+        add(f"intervention.{iv}.outcome", spec.get("outcome"))
+        add(f"intervention.{iv}.horizon_days", spec.get("horizon_days"))
+        r = spec.get("rct_reference") or {}
+        add(f"intervention.{iv}.rct",
+            f"{r.get('source')}: RD={r.get('risk_difference')} CI={r.get('ci')} "
+            f"@{r.get('horizon_days')}d")
+        add(f"intervention.{iv}.rct_derivation", r.get("derivation"))
+
+    # dataset versions
+    for k, v in (cfg.get("dataset_versions") or {}).items():
+        add(f"dataset_version.{k}", v)
+
+    # environment
+    for pkg in ["numpy", "pandas", "pyarrow", "scipy", "scikit-learn", "lightgbm", "pyyaml"]:
+        try:
+            add(f"pkg.{pkg}", md.version(pkg))
+        except md.PackageNotFoundError:
+            add(f"pkg.{pkg}", None)
+
+    # wall-clock, filled by the stages that know it
+    add("walltime.embeddings_sec", None)
+    add("walltime.estimate_sec", None)
+    add("walltime.synthetic_sec", None)
+
+    p = cfg.storage("results", "manifest.csv")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(SCHEMAS["manifest.csv"])
+        w.writerows(rows)
+    log(f"manifest.csv: {len(rows)} keys")
+    return len(rows)

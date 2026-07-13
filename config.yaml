@@ -1,69 +1,83 @@
-# config.yaml — multimodal adjustment for ICU treatment-effect estimation
-# Single source of truth. main_causal.py reads only this file.
+# config.yaml -- RCT-anchored audit of multimodal causal adjustment in the ICU
+# SINGLE SOURCE OF TRUTH. main.py reads only this file.
 #
-# Authored by Soroosh (values are fixed); the analyst sets only the machine paths
-# below. Folded in from config_Soroosh.yaml on 2026-06-21. Path strings support
-# ${ENV} / ${ENV:default} interpolation (resolved in src/cfg.py).
+# Path strings support ${ENV} / ${ENV:default} interpolation (resolved in src/cfg.py).
+# Only the `paths:` block is machine-specific. Everything below it is the study design
+# and must not be edited without updating docs/METHODS.md.
 
-# ----------------------------------------------------------------------
+# ======================================================================
+# PATHS
+# ======================================================================
 paths:
-  # outputs: all embeddings, intermediates, results live here (outside the repo, §0)
   storage_root: ${CTFM_STORAGE:/home/woody/iwi5/iwi5406h/ctfm_storage}
-  uploads:      ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}      # raw datasets
-  outputs:      ${CTFM_STORAGE:/home/woody/iwi5/iwi5406h/ctfm_storage}/results
 
-  # input sub-locations on this machine (reuse the existing link layer + event stream)
+  # ---- inputs (raw data, read-only) ----
+  datasets_dir: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}
   data_dir:     ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}
   link_dir:     ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/link
-  event_stream:     ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/event_stream_clean   # cleaned copy (A1)
-  event_stream_raw: ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/event_stream         # raw, pre-clean (A1)
-  ed_dir:       ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/mimic-iv-ed-2.2/ed   # (A1)
-  mimic_dir:    ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/mimiciv/3.1
-  cxr_master:   ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/mimic_master_list.csv
-  cxr_images:   ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/preprocessed
-  notes_dir:    ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/mimic-iv-note/2.2
-  eicu_dir:     ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/eicu-crd/2.0
-  external_cxr:                  # §3 image-embedding quality gate (RAD-DINO over external CXR sets)
+  event_stream_raw: ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/event_stream
+  event_stream:     ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/event_stream_clean
+
+  mimic_dir:  ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/mimiciv/3.1
+  ed_dir:     ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/mimic-iv-ed/2.2/ed
+  notes_dir:  ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/mimic-iv-note/2.2
+  eicu_dir:   ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/eicu-crd/2.0
+  cxr_master: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/mimic_master_list.csv
+  cxr_images: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/preprocessed
+
+  # external CXR sets -- embedding QUALITY GATE only, never enter the causal models
+  external_cxr:
     padchest:
       csv:         /home/hpc/iwi5/iwi5406h/fix10april/Project/padchest_trainval.csv
       images_root: /home/vault/iwi5/iwi5406h/preprocessed_Padchest
       id_col:      ImageID
       view_col:    view
       path:        "{images_root}/{ImageDir}/{ImageID}"
+      label_map:   {edema: pulmonary_edema, effusion: pleural_effusion, cardiomegaly: cardiomegaly}
     chestxray14:
       csv:         ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/final_cxr14_master_list.csv
       images_root: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/chestxray14/preprocessed
       id_col:      image_id
       view_col:    view_position
       path:        "{images_root}/{img_rel_path}"
+      label_map:   {edema: edema, effusion: effusion, cardiomegaly: cardiomegaly}
     chexpert:
       csv:         ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/chexpert_gate_master.csv
       images_root: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/preprocessed_chxpert
       id_col:      image_id
-      view_col:    AP_PA                     # 'view' is Frontal/Lateral; AP_PA passes _is_frontal
+      view_col:    AP_PA
       path:        "{images_root}/{img_path}"
+      label_map:   {edema: edema, effusion: pleural_effusion, cardiomegaly: cardiomegaly}
 
-  # storage subdirectories (created under storage_root)
+  # ---- storage subdirectories (created under storage_root) ----
   embeddings:  embeddings
-  cohorts:     cohorts
+  manifests:   manifests          # cohorts.parquet, embeddings_index.parquet, features_structured.parquet
   checkpoints: checkpoints
   results:     results
 
-# ----------------------------------------------------------------------
+# CheXpert label columns present in mimic_master_list.csv
+# encoding: 1=positive, 0=negative, 2=not-mentioned, 3=uncertain
+chexpert_labels:
+  [atelectasis, cardiomegaly, consolidation, edema, enlarged_cardiomediastinum,
+   fracture, lung_lesion, lung_opacity, no_finding, pleural_effusion, pleural_other,
+   pneumonia, pneumothorax, support_devices]
+
+# ======================================================================
+# RUN
+# ======================================================================
 run:
   seed: 42
-  effect_measure: risk_difference      # active arm minus comparator
+  effect_measure: risk_difference    # active arm minus comparator
   effect_scale: percentage_points
   effect_decimals: 1
   multiple_testing: benjamini_hochberg
 
 bootstrap:
-  n_resamples: 10000
-  unit: patient                        # patient-level cluster bootstrap
-  reuse_indices_across_conditions: true
+  n_resamples: 2000                  # patient-level cluster bootstrap
+  unit: patient
+  reuse_indices_across_conditions: true   # paired contrasts
 
-# ----------------------------------------------------------------------
-dataset_versions:                      # pin exactly; record in manifest.csv
+dataset_versions:
   mimic_iv: "3.1"
   mimic_iv_ed: "2.2"
   mimic_iv_note: "2.2"
@@ -73,81 +87,230 @@ dataset_versions:                      # pin exactly; record in manifest.csv
   chestxray14: "snapshot_in_house"
   padchest: "snapshot_in_house"
 
-# ----------------------------------------------------------------------
-images:
-  encoder: rad-dino
-  size: 224
-  views: [PA, AP, AP_erect, AP_supine]   # frontal only; lateral dropped
-  resize_once_to_storage: true
+# ======================================================================
+# MODALITIES
+#
+# MIMIC-IV-Note contains exactly two tables: `discharge` and `radiology`.
+# There are NO nursing / progress / admission notes in this release.
+# A discharge summary's charttime is the DISCHARGE time of its own hospitalization,
+# so a discharge summary observed strictly before t0 (t0 = during the CURRENT ICU
+# stay) necessarily belongs to a PRIOR hospitalization. The two text channels below
+# are therefore named for what they actually are.
+# ======================================================================
+modalities:
+  images:                            # I -- pixels
+    encoder: rad-dino
+    hf_id: microsoft/rad-dino
+    size: 224
+    views: [PA, AP, AP_erect, AP_supine]      # frontal only; lateral dropped
+    source: mimic_cxr_frontal
 
-text:
-  encoder: clinical-longformer
-  max_tokens: 4096
-  variants:
-    notes_clinical: { exclude_radiology_reports: true }   # default note modality
-    notes_all:      { exclude_radiology_reports: false }  # used only in decomposition
+  radtext:                           # Rtxt -- CONTEMPORANEOUS expert text (radiologist's read)
+    encoder: clinical-longformer
+    hf_id: yikuan8/Clinical-Longformer
+    max_tokens: 4096
+    source: mimic_iv_note/radiology
+
+  histnote:                          # Hnote -- PRIOR-ADMISSION discharge summary (history narrative)
+    encoder: clinical-longformer
+    hf_id: yikuan8/Clinical-Longformer
+    max_tokens: 4096
+    source: mimic_iv_note/discharge
+    note: "necessarily from a PRIOR hospitalization; ~55% coverage; missingness indicator added"
+
+  images_alt:                        # robustness encoder swap only
+    encoder: biomedclip
+    hf_id: "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+    size: 224
+    source: mimic_cxr_frontal
 
 pooling:
   rule: mean
-  look_back_window_hours: 48           # only pre-time-zero data within this window
+  look_back_window_hours: 48         # strictly pre-t0, within this window
 
-# ----------------------------------------------------------------------
+# ======================================================================
+# COHORT GATE
+#
+# PRIMARY GATE = eligible + >=1 pre-t0 frontal CXR.
+# Imaging is the gate because every CXR has a paired radiology report, so I and
+# Rtxt are available for 100% of the primary cohort. Requiring a pre-t0 discharge
+# summary instead would silently restrict the cohort to READMITTED patients
+# (selection on healthcare utilization, which predicts both treatment and death).
+# Hnote coverage is therefore partial and is handled with a missingness indicator.
+# ======================================================================
+cohort:
+  primary_gate: pre_t0_frontal_cxr
+  histnote_missing_indicator: true
+  report_scopes: [eligible, imaged, imaged_with_histnote]
+
+# ======================================================================
+# ESTIMATOR
+# ======================================================================
 estimator:
-  method: aipw                         # cross-fitted AIPW everywhere
+  method: aipw                       # cross-fitted AIPW everywhere
   nuisance_model: lightgbm
   cross_fitting_folds: 5
-  # decision 4 (Soroosh-approved): reduce each embedding modality to a cross-fitted
-  # propensity score + prognostic score before it enters the nuisance models.
-  # 'raw' (failure case) and 'pca' (sensitivity) are run as --variant overrides.
-  embedding_reduction: score
+  trim: 0.01
+  # Embedding reduction. NESTED inside each outer AIPW fold (refit per outer fold on
+  # that fold's training rows only) so no test-fold information reaches the reduction.
+  # A shared or merely reseeded partition leaks; nesting is the only correct fix.
+  embedding_reduction: score         # score | pca | none
+  reduction_nested: true
+  pca_components: 30
+  # Overlap weights (ATO, Li/Morgan/Zaslavsky) reported ALONGSIDE the ATE. Under the
+  # poor overlap that high-dimensional adjustment induces, the ATE is fragile but the
+  # ATO has a well-defined estimand (the clinical-equipoise population).
+  report_ato: true
 
-# SENSITIVITY variants (decision 4): --variant <name> overrides the embedding
-# reduction + output dir. The main run uses the estimator block above (score ->
-# results/). Reported alongside: raw = the overlap failure case (negative control
-# catches it, a real finding); pca = PCA-k sensitivity.
-#   python main_causal.py --stage <stage> --variant raw   # raw 1,536-d embeddings
-#   python main_causal.py --stage <stage> --variant pca   # PCA-k per modality
-variants:
-  raw:
-    reduction: none
-    results_dir: results_raw
-  pca:
-    reduction: pca
-    pca_components: 30
-    results_dir: results_pca
+# ======================================================================
+# ADJUSTMENT LADDER
+#   naive          : unadjusted
+#   expert         : clinician-curated structured confounders (the design-based competitor)
+#   structured     : all extractable structured covariates at t0    <-- the BASELINE all
+#                    modality conditions are contrasted against
+#   struct_img     : structured + image embedding
+#   struct_radtext : structured + radiology-report text embedding
+#   struct_histnote: structured + prior-discharge-summary embedding
+#   multimodal     : structured + all three
+# ======================================================================
+conditions: [naive, expert, structured, struct_img, struct_radtext, struct_histnote, multimodal]
 
-conditions: [naive, structured, plus_notes, plus_imaging_only, full, design_based]
+modality_conditions:                 # condition -> the modality it ADDS to `structured`
+  struct_img: images
+  struct_radtext: radtext
+  struct_histnote: histnote
+  multimodal: all
 
-# CheXpert structured labels carried on cxr_studies by the data-prep link layer (A1);
-# match the columns in the MIMIC-CXR master. The image validity probe reads `edema`.
-chexpert_labels: [atelectasis, cardiomegaly, consolidation, edema, enlarged_cardiomediastinum,
-  fracture, lung_lesion, lung_opacity, no_finding, pleural_effusion, pleural_other,
-  pneumonia, pneumothorax, support_devices]
+# ======================================================================
+# THE DIAGNOSTIC (the paper's methodological contribution)
+#
+# A modality M reduces confounding bias only if it carries INCREMENTAL information
+# about BOTH treatment and outcome, conditional on the structured set S.
+#   dAUC_A(M) = AUC[e(S,M)] - AUC[e(S)]      cross-fitted
+#   dAUC_Y(M) = AUC[m(S,M)] - AUC[m(S)]      cross-fitted
+#   ICI(M)    = min(dAUC_A, dAUC_Y)          the binding constraint
+#   PositivityCost(M) = 1 - ESS(S,M)/ESS(S)
+# Decision rule: add M iff dAUC_A >= t AND dAUC_Y >= t AND PositivityCost <= c.
+# ======================================================================
+diagnostic:
+  auc_threshold: 0.02                # t
+  positivity_cost_max: 0.25          # c
+  bootstrap_reps: 500                # for the dAUC CIs
 
-robustness_swaps:
-  encoder_alt: biomedclip
-  estimator_alt: tmle
-  look_back_window_alt_hours: 24
-  pooling_alt: max
+# ======================================================================
+# SEMI-SYNTHETIC BENCHMARK (the proof the estimator works and the null is real)
+#
+# Built on the REAL fluids_sepsis cohort with REAL structured covariates and REAL
+# image embeddings. Only A and Y are simulated, with a KNOWN tau.
+#   U   = cross-fitted P(edema | image embedding)   (real, validated image signal)
+#   U_p = residual of U after projecting out S      (the INCREMENTAL image information)
+#   A ~ Bern(sigmoid(a0 + a1'S~ + gamma * U_p))
+#   Y ~ Bern(sigmoid(b0 + b1'S~ + delta * U_p + tau * A))
+# Sweep gamma (confounding into treatment) x delta (confounding into outcome).
+# Expected: bias(structured) grows with gamma*delta; struct_img recovers tau.
+# The resulting curve (bias reduction vs ICI) is the CALIBRATION CURVE on which the
+# four real interventions are then placed.
+# ======================================================================
+synthetic:
+  base_intervention: fluids_sepsis
+  gamma_grid: [0.0, 0.5, 1.0, 1.5, 2.0]      # confounder -> treatment strength
+  delta_grid: [0.0, 0.5, 1.0, 1.5, 2.0]      # confounder -> outcome strength
+  replicates: 20
+  target_rd_pp: -5.0                          # the known truth tau, in percentage points
+  # redundancy sweep: hold total confounding fixed, vary how much of U is already
+  # predictable from S. Isolates the mechanism (redundancy, not weakness).
+  redundancy_grid: [0.0, 0.25, 0.5, 0.75, 1.0]
+  redundancy_gamma: 1.5
+  redundancy_delta: 1.5
 
-# ----------------------------------------------------------------------
-demographics:
-  age_at: time_zero
-  drop_age_empty_or_zero: true
-  age_bands: ["(0,40]", "(40,55]", "(55,70]", "(70,120]"]   # right-inclusive, left-exclusive
-  sex_levels: [F, M]
-  mimic_age_over_89_anchor_note: "MIMIC-IV shifts ages >89 to a single anchor; top band absorbs it"
-
-# ----------------------------------------------------------------------
+# ======================================================================
 # INTERVENTIONS
-# Each: eligibility, time_zero, the two arms, outcome+horizon, negative control,
-# the RCT reference (active minus comparator, percentage points), and the
-# expert structured confounder set used by the design_based condition.
-# ----------------------------------------------------------------------
+# RCT references verified against the primary publications. Do not edit without
+# re-checking the source. `role` is pre-specified and determines interpretation.
+# ======================================================================
 interventions:
 
+  fluids_sepsis:
+    role: primary_null_calibration           # best n, best overlap -> the primary analysis
+    eligibility:
+      suspected_infection: true
+      sepsis_induced_hypotension: true       # SBP<100 after >=1L crystalloid, or vasopressor
+      within_hours_of_icu_admit: 24
+    time_zero: onset_sepsis_induced_hypotension
+    arms:
+      active: restrictive_fluids             # <30 ml/kg crystalloid in 24h OR vasopressor before 30 ml/kg
+      comparator: liberal_fluids
+    outcome: all_cause_mortality
+    horizon_days: 90
+    negative_control_outcome: icu_acquired_uti
+    imaging_confounder_label: edema          # pulmonary edema: the latent confounder imaging should carry
+    rct_reference:
+      source: [CLOVERS, CLASSIC]
+      risk_difference: -0.6
+      ci: [-3.4, 2.3]
+      horizon_days: 90
+      target_type: "null"
+      derivation: "fixed-effect IV meta of CLOVERS (-0.9, CI -4.4/2.6) and CLASSIC adjusted (0.1, CI -4.7/4.9)"
+    expert_confounders: [age, sex, sofa_total, lactate, mean_arterial_pressure, vasopressor_use,
+      creatinine, urine_output_6h, heart_failure_history, ckd_history]
+
+  transfusion_threshold:
+    role: null_calibration_structured_anchor  # key confounder (Hb) IS structured -> imaging must not help
+    eligibility:
+      septic_shock: true
+      hemoglobin_lt: 9.0
+      in_icu: true
+    time_zero: first_hemoglobin_lt_9_in_septic_shock
+    arms:
+      active: restrictive_transfuse_at_hb_le_7
+      comparator: liberal_transfuse_at_hb_le_9
+    outcome: all_cause_mortality
+    horizon_days: 90
+    negative_control_outcome: icu_acquired_uti
+    imaging_confounder_label: edema
+    structured_confounder: hemoglobin
+    rct_reference:
+      source: TRISS
+      risk_difference: -1.9
+      ci: [-8.1, 4.2]
+      horizon_days: 90
+      target_type: "null"
+      derivation: "exact counts 216/502 (43.0%) vs 223/496 (45.0%); Wald"
+      sensitivity_reference: {source: TRICC, risk_difference: -4.6, ci: [-10.2, 0.8], horizon_days: 30}
+    expert_confounders: [age, sex, hemoglobin, sofa_total, lactate, coronary_artery_disease,
+      platelets, vasopressor_use, creatinine]
+
+  rrt_timing:
+    role: null_calibration_text_hypothesis    # the "urgency lives in text" test
+    eligibility:
+      aki_kdigo_stage_in: [2, 3]              # creatinine route OR urine-output route
+      no_urgent_rrt_indication: true          # no severe hyperkalemia / acidosis / uremia
+      in_icu: true
+    time_zero: first_kdigo_stage2_3_without_urgent_indication
+    arms:
+      active: accelerated_rrt_within_12h
+      comparator: standard_delayed_rrt
+    outcome: all_cause_mortality
+    horizon_days: 90
+    negative_control_outcome: icu_acquired_uti
+    imaging_confounder_label: edema           # fluid overload is visible on CXR
+    rct_reference:
+      source: STARRT-AKI
+      risk_difference: 0.2
+      ci: [-0.3, 0.4]
+      horizon_days: 90
+      target_type: "null"
+      derivation: "NEJM 2020 reports the absolute RD and CI directly; do NOT back-derive from the RR"
+      note: "CI is only 0.7pp wide. inside-CI is therefore NOT a usable metric; use divergence_z."
+    expert_confounders: [age, sex, sofa_total, creatinine, bun, potassium, urine_output_6h,
+      bicarbonate, ph, vasopressor_use, ckd_history, mechanical_ventilation]
+
   prone_positioning:
-    role: positive_control
+    role: positivity_failure_case             # PRE-SPECIFIED as such. ~61 treated in the imaged
+                                              # cohort; confounding by indication is extreme
+                                              # (proning is rescue therapy). Reported as evidence
+                                              # that overlap, not proxy richness, is the binding
+                                              # constraint. NOT used as a positive control.
     eligibility:
       ards_severe: true
       pao2_fio2_lt: 150
@@ -162,118 +325,71 @@ interventions:
     outcome: all_cause_mortality
     horizon_days: 28
     negative_control_outcome: icu_acquired_uti
-    imaging_confounder_label: edema          # MIMIC-CXR-JPG label for the validity probe
+    imaging_confounder_label: edema
     rct_reference:
       source: PROSEVA
       risk_difference: -16.8
       ci: [-24.5, -9.1]
       horizon_days: 28
       target_type: nonzero
-    expert_confounders: [age, sex, bmi, sofa_total, pao2_fio2, peep, fio2, plateau_pressure,
-      vasopressor_dose, lactate, creatinine, gcs, hours_since_intubation, immunosuppression]
+      derivation: "16.0% (n=237) vs 32.8% (n=229); Wald"
+    expert_confounders: [age, sex, sofa_total, pao2_fio2, peep, fio2, plateau_pressure,
+      vasopressor_use, lactate, creatinine, gcs, immunosuppression]
 
-  fluids_sepsis:
-    role: null_calibration_imaging
-    eligibility:
-      suspected_infection: true
-      sepsis_induced_hypotension: true       # SBP<100 after >=1L crystalloid, or vasopressor
-      within_hours_of_icu_admit: 24
-    time_zero: onset_sepsis_induced_hypotension
-    arms:
-      active: restrictive_fluids             # <30 ml/kg crystalloid in 24h OR vasopressor before 30 ml/kg
-      comparator: liberal_fluids
-    outcome: all_cause_mortality
-    horizon_days: 90
-    negative_control_outcome: icu_acquired_uti
-    imaging_confounder_label: edema          # pulmonary edema is the latent confounder here
-    rct_reference:
-      source: [CLOVERS, CLASSIC]             # both 90-day, both null -> fixed-effect meta-analytic
-      risk_difference: -0.6                   # B2: re-pooled with CLASSIC adjusted RD 0.1 (was naive 0.2)
-      ci: [-3.4, 2.3]                         # fixed-effect inverse-variance meta of the two
-      horizon_days: 90
-      target_type: null
-    expert_confounders: [age, sex, sofa_total, lactate, mean_arterial_pressure, vasopressor_dose,
-      creatinine, urine_output_6h, crystalloid_volume_pre_t0, heart_failure_history, ckd_history,
-      infection_source]
+# ======================================================================
+# POSITIVE CONTROLS (two, neither of which is prone)
+#   1. REAL       : structured adjustment must reduce |bias| vs naive where overlap is
+#                   adequate. Asserted in integrity_check. Proves the machinery works
+#                   on real data.
+#   2. SYNTHETIC  : struct_img must recover the known tau when confounding is routed
+#                   through the image channel (gamma>0, delta>0). Proves a null on real
+#                   data is a statement about the DATA, not the METHOD.
+# ======================================================================
+positive_controls:
+  real_structured_beats_naive:
+    interventions: [fluids_sepsis, transfusion_threshold]   # the adequate-overlap pair
+    min_bias_reduction_pp: 2.0
+  synthetic_image_recovers_tau:
+    min_bias_reduction_pp: 2.0
+    at_gamma: 1.5
+    at_delta: 1.5
 
-  rrt_timing:
-    role: null_calibration_notes
-    eligibility:
-      aki_kdigo_stage_in: [2, 3]
-      no_urgent_rrt_indication: true         # no severe hyperkalemia/acidosis/uremia/overload
-      in_icu: true
-    time_zero: first_kdigo_stage2_3_without_urgent_indication
-    arms:
-      active: accelerated_rrt_within_12h
-      comparator: standard_delayed_rrt
-    outcome: all_cause_mortality
-    horizon_days: 90
-    negative_control_outcome: icu_acquired_uti
-    notes_confounder: clinician_urgency_and_trajectory_gestalt
-    rct_reference:
-      source: STARRT-AKI
-      risk_difference: 0.2
-      ci: [-0.3, 0.4]                        # B2: NEJM STARRT-AKI reports RD+CI directly (prev CI ~10x too wide)
-      horizon_days: 90
-      target_type: null
-    expert_confounders: [age, sex, sofa_total, creatinine, bun, potassium, urine_output_6h,
-      bicarbonate, ph, fluid_balance_cumulative, vasopressor_use, ckd_history, mechanical_ventilation]
-
-  transfusion_threshold:
-    role: null_calibration_structured_anchor
-    eligibility:
-      septic_shock: true
-      hemoglobin_lt: 9.0
-      in_icu: true
-    time_zero: first_hemoglobin_lt_9_in_septic_shock
-    arms:
-      active: restrictive_transfuse_at_hb_le_7
-      comparator: liberal_transfuse_at_hb_le_9
-    outcome: all_cause_mortality
-    horizon_days: 90
-    negative_control_outcome: icu_acquired_uti
-    structured_confounder: hemoglobin        # key confounder is structured -> imaging should not help
-    rct_reference:
-      source: TRISS                          # primary; horizon and population match
-      risk_difference: -1.9                   # B2: exact TRISS counts 216/502 vs 223/496
-      ci: [-8.1, 4.2]
-      horizon_days: 90
-      target_type: null
-      sensitivity_reference:                 # different horizon/population -> not pooled, sensitivity only
-        source: TRICC
-        risk_difference: -4.6
-        ci: [-10.2, 0.8]
-        horizon_days: 30
-    expert_confounders: [age, sex, hemoglobin, sofa_total, lactate, coronary_artery_disease,
-      active_bleeding, platelets, vasopressor_use, creatinine]
-
-# ----------------------------------------------------------------------
+# ======================================================================
+# EXTERNAL VALIDATION
+# eICU-CRD public release has NO usable free text and NO linked imaging.
+# Structured-only replication. Do NOT attempt an eICU note-embedding stage.
+# ======================================================================
 external:
   dataset: eicu_crd
-  conditions: [structured, plus_notes]       # no imaging available externally
+  conditions: [naive, structured]
+  interventions: [fluids_sepsis, transfusion_threshold, rrt_timing]
 
-# ----------------------------------------------------------------------
-# §3 image-embedding QUALITY GATE (a check, not a result): does RAD-DINO
-# separate known findings on EXTERNAL chest-X-ray datasets? These never enter
-# the causal models. Machine paths set by the analyst. CheXpert added when uploaded.
+# ======================================================================
+# ROBUSTNESS SWAPS
+# ======================================================================
+robustness_swaps:
+  encoder_alt: images_alt            # BiomedCLIP
+  estimator_alt: tmle
+  look_back_window_alt_hours: 24
+  pooling_alt: max
+  reduction_alt: pca                 # now a first-class axis, not a hidden variant
+  trim_alt: 0.05
+
+# ======================================================================
+# DEMOGRAPHICS / SUBGROUPS
+# ======================================================================
+demographics:
+  age_at: time_zero
+  drop_age_empty_or_zero: true
+  age_bands: ["(0,40]", "(40,55]", "(55,70]", "(70,120]"]   # left-exclusive, right-inclusive
+  sex_levels: [F, M]
+  min_arm_events: 5                  # else the subgroup is `undefined`
+  max_abs_rd_pp: 100                 # an RD outside +/-100pp is impossible -> `undefined`, never printed
+
+# ======================================================================
+# EMBEDDING QUALITY GATE (a check, not a result)
+# ======================================================================
 quality_gate:
-  sample_per_dataset: 30000                   # gate, not a result -> a sample suffices
+  sample_per_dataset: 30000
   probe_labels: [edema, effusion, cardiomegaly]
-  datasets:
-    padchest:
-      images: /home/vault/iwi5/iwi5406h/preprocessed_Padchest
-      master: /home/hpc/iwi5/iwi5406h/fix10april/Project/padchest_trainval.csv
-      path_cols: [ImageDir, ImageID]          # abs path = images/ImageDir/ImageID
-      view_col: view
-      label_map: {edema: pulmonary_edema, effusion: pleural_effusion, cardiomegaly: cardiomegaly}
-    chestxray14:
-      images: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/chestxray14/preprocessed
-      master: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/final_cxr14_master_list.csv
-      path_col: img_rel_path                  # abs path = images/img_rel_path
-      view_col: view_position
-      label_map: {edema: edema, effusion: effusion, cardiomegaly: cardiomegaly}
-    chexpert:
-      images: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/preprocessed_chxpert
-      master: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/chexpert_gate_master.csv
-      view_col: AP_PA                         # keycol=image_id, pidcol=patient_id (present in prepared master)
-      label_map: {edema: edema, effusion: pleural_effusion, cardiomegaly: cardiomegaly}
+  min_auroc: 0.70                    # MIMIC image proxy must clear this before estimating

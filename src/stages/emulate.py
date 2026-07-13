@@ -1,22 +1,31 @@
-"""§9.5  emulate -- target-trial emulation; build an intervention's cohort.
+"""emulate -- target-trial emulation. Builds every intervention's cohort.
 
-New-user active-comparator design at a single time zero (§4). Builds the eligible
-cohort, assigns the two arms, fixes the outcome at the horizon, applies the
-all-modality gate (>=1 pre-t0 frontal CXR AND >=1 pre-t0 non-radiology note), and
-writes CONSORT accounting to cohorts.csv. Time-zero discipline: only data strictly
-before t0 is used downstream (the cohort table stores t0; adjustment vars are
-pulled pre-t0 in `estimate`).
+New-user, active-comparator design at a single time zero. For each intervention: apply
+eligibility, fix t0, assign the two arms, resolve the outcome at the horizon, apply the
+modality gate, and record CONSORT.
 
-Membership uses the link layer (cxr_studies timestamps, discharge-note charttimes)
-and the cleaned event stream -- it does NOT need the embedding vectors, which are
-joined later at `estimate`. So this stage runs before/independently of the GPU job.
+THE GATE (changed, and this is the most consequential change in the rewrite)
 
-Per-intervention clinical logic lives in a builder; fluids_sepsis is implemented
-(§9.5 starts here). The cohort table is saved to paths.cohorts/<intervention>.parquet.
+  PRIMARY GATE = eligible + >=1 pre-t0 frontal chest X-ray.
 
-DESIGN CHOICES flagged inline (suspected-infection proxy, itemid sets, weight
-source) are the analyst's operationalization of the config rules -- listed in
-docs/QUESTIONS_FOR_SOROOSH.md for confirmation; not improvised statistics.
+  The previous design also required a pre-t0 discharge summary. That was wrong, and
+  silently so. A discharge summary's charttime is the DISCHARGE time of its own
+  hospitalization. t0 falls during the CURRENT ICU stay. So a discharge summary observed
+  before t0 can only have come from an EARLIER hospitalization -- and requiring one
+  restricted the entire headline cohort to patients who had been hospitalized before.
+  That is selection on prior healthcare utilization, which predicts both treatment and
+  death. It cost ~35% of the sample and introduced a bias nobody had accounted for.
+
+  Imaging is the right gate because every chest X-ray has a paired radiology report, so
+  the image channel and the contemporaneous-text channel are both available for 100% of
+  the primary cohort. The prior-discharge-summary channel (`histnote`) is available for
+  roughly 55% and is handled with an explicit missingness indicator, not a hidden filter.
+
+Membership uses only the link layer and the cleaned event stream, so this stage runs
+independently of the GPU embedding job.
+
+Writes ONE consolidated manifest: manifests/cohorts.parquet, with an `intervention`
+column. CONSORT goes to results/cohorts.csv.
 """
 from __future__ import annotations
 
@@ -373,90 +382,123 @@ _BUILDERS = {
 }
 
 
+
+
 def _outcome_and_gate(cfg, intervention, cohort, consort):
-    iv = cfg.get(f"interventions.{intervention}")
-    horizon = int(iv["horizon_days"])
+    """Resolve the outcome at the horizon, then apply the modality gate.
+
+    Sets these flags on every eligible patient (nothing is dropped here -- the flags
+    define the analysis scopes, and the `eligible` scope is reported alongside `imaged`
+    so the cost of the gate is visible rather than assumed away):
+
+      has_pre_t0_cxr       >=1 frontal CXR strictly before t0   -> THE PRIMARY GATE
+      has_pre_t0_radtext   >=1 radiology report strictly before t0
+      has_pre_t0_histnote  >=1 discharge summary strictly before t0
+                           == the patient had a PRIOR hospitalization
+      imaged               == has_pre_t0_cxr  (the primary analysis cohort)
+    """
+    horizon = int(cfg.get(f"interventions.{intervention}.horizon_days"))
     patients = ev.link(cfg, "patients")
 
-    # outcome: all-cause mortality within horizon of t0 (MIMIC dod)
+    # outcome: all-cause mortality within the horizon of t0 (MIMIC dod)
     dod = patients.set_index("subject_id")["dod"]
     cohort["dod"] = pd.to_datetime(cohort["subject_id"].map(dod))
     days = (cohort["dod"] - cohort["t0"]).dt.total_seconds() / 86400.0
     cohort["outcome"] = ((days >= 0) & (days <= horizon)).astype(int)
-
-    # sex
     cohort["sex"] = cohort["subject_id"].map(patients.set_index("subject_id")["gender"])
 
-    # all-modality gate: pre-t0 frontal CXR AND pre-t0 non-radiology (discharge) note
+    # ---- imaging: frontal CXR strictly before t0 ----
     cxr = ev.link(cfg, "cxr_studies")
     cxr["study_datetime"] = pd.to_datetime(cxr["study_datetime"], errors="coerce")
-    cxr = cxr[cxr["views"].str.contains("PA|AP", case=False, na=False)]  # frontal only
-    pre_cxr = cxr.merge(cohort[["subject_id", "t0"]], on="subject_id", how="inner")
-    has_cxr = set(pre_cxr.loc[pre_cxr["study_datetime"] < pre_cxr["t0"], "subject_id"])
+    cxr = cxr[cxr["views"].str.contains("PA|AP", case=False, na=False)]   # frontal only
+    pre = cxr.merge(cohort[["subject_id", "t0"]], on="subject_id", how="inner")
+    has_cxr = set(pre.loc[pre["study_datetime"] < pre["t0"], "subject_id"])
 
-    # note gate relaxed (decision 2): discharge OR radiology report counts.
+    # ---- text: which patients have each kind of note strictly before t0 ----
     note_root = cfg.input("notes_dir") / "note"
+
     def _pre_t0_subjects(fname):
         n = pd.read_csv(note_root / fname, usecols=["subject_id", "charttime"])
         n["charttime"] = pd.to_datetime(n["charttime"], errors="coerce")
         m = n.merge(cohort[["subject_id", "t0"]], on="subject_id", how="inner")
         return set(m.loc[m["charttime"] < m["t0"], "subject_id"])
-    has_disch = _pre_t0_subjects("discharge.csv.gz")
-    has_rad = _pre_t0_subjects("radiology.csv.gz")
+
+    has_rad = _pre_t0_subjects("radiology.csv.gz")      # contemporaneous expert text
+    has_disch = _pre_t0_subjects("discharge.csv.gz")    # PRIOR-admission history
 
     cohort["has_pre_t0_cxr"] = cohort["subject_id"].isin(has_cxr)
-    cohort["has_pre_t0_note"] = cohort["subject_id"].isin(has_disch)               # D2/B1: discharge note = primary gate
-    cohort["has_pre_t0_note_incl_rad"] = cohort["subject_id"].isin(has_disch | has_rad)  # relaxed (sensitivity)
-    cohort["has_pre_t0_disch_note"] = cohort["subject_id"].isin(has_disch)
-    cohort["all_modality"] = cohort["has_pre_t0_cxr"] & cohort["has_pre_t0_note"]   # requires a discharge note
-    # D2: radiology-only patients (pass the relaxed gate but have no discharge note)
-    rad_only = int((cohort["has_pre_t0_note_incl_rad"] & ~cohort["has_pre_t0_note"]).sum())
-    consort.append(("with_pre_t0_frontal_cxr", int(cohort["has_pre_t0_cxr"].sum())))
-    consort.append(("with_pre_t0_discharge_note", int(cohort["has_pre_t0_note"].sum())))
-    consort.append(("radiology_only_note_excluded", rad_only))
-    consort.append(("all_modality_cohort", int(cohort["all_modality"].sum())))
-    consort.append(("all_modality_deaths", int(cohort.loc[cohort["all_modality"], "outcome"].sum())))
+    cohort["has_pre_t0_radtext"] = cohort["subject_id"].isin(has_rad)
+    cohort["has_pre_t0_histnote"] = cohort["subject_id"].isin(has_disch)
+    cohort["imaged"] = cohort["has_pre_t0_cxr"]                    # THE PRIMARY GATE
+
+    n_elig = len(cohort)
+    n_img = int(cohort["imaged"].sum())
+    n_hist = int((cohort["imaged"] & cohort["has_pre_t0_histnote"]).sum())
+
+    consort += [
+        ("with_pre_t0_frontal_cxr", int(cohort["has_pre_t0_cxr"].sum())),
+        ("with_pre_t0_radiology_report", int(cohort["has_pre_t0_radtext"].sum())),
+        ("with_pre_t0_prior_discharge_summary", int(cohort["has_pre_t0_histnote"].sum())),
+        ("PRIMARY_imaged_cohort", n_img),
+        ("imaged_deaths", int(cohort.loc[cohort["imaged"], "outcome"].sum())),
+        ("imaged_active_arm", int((cohort["imaged"] & (cohort["arm"] == "active")).sum())),
+        ("imaged_comparator_arm",
+         int((cohort["imaged"] & (cohort["arm"] == "comparator")).sum())),
+        ("imaged_with_histnote", n_hist),
+        ("histnote_coverage_pct_of_imaged", round(100.0 * n_hist / n_img, 1) if n_img else 0),
+        # the cost of the OLD (wrong) gate, recorded so the change is auditable
+        ("OLD_gate_cxr_and_histnote_would_have_been", n_hist),
+        ("OLD_gate_patients_recovered_by_fix", n_img - n_hist),
+    ]
     return cohort, consort
 
 
-def run(cfg, force: bool = False, intervention: str = "fluids_sepsis"):
-    iv = cfg.get(f"interventions.{intervention}")
-    if iv is None:
-        raise KeyError(f"unknown intervention '{intervention}'")
-    cfg.require(f"interventions.{intervention}.eligibility",
-                f"interventions.{intervention}.time_zero",
-                f"interventions.{intervention}.outcome",
-                f"interventions.{intervention}.horizon_days",
-                "pooling.look_back_window_hours")
-    if intervention not in _BUILDERS:
-        raise NotImplementedError(
-            f"emulate builder for '{intervention}' not implemented yet; "
-            f"implemented: {list(_BUILDERS)} (fluids_sepsis first per §9.5).")
+def run(cfg, force: bool = False, intervention: str = None):
+    """Build one intervention's cohort, or ALL of them when intervention is None.
+
+    Running every intervention by default is deliberate: the previous pipeline defaulted
+    to a single intervention and `--stage all` therefore produced a one-intervention study
+    while looking like it had produced a four-intervention one.
+    """
+    from src import results as R
+
+    names = ([intervention] if intervention
+             else [k for k in (cfg.get("interventions") or {}) if k in _BUILDERS])
+    unknown = [n for n in names if n not in _BUILDERS]
+    if unknown:
+        raise NotImplementedError(f"no emulate builder for {unknown}; have {list(_BUILDERS)}")
 
     ckpt = Checkpoint(cfg, "emulate")
-    t0 = time.time()
-    log(f"emulate[{intervention}]: building cohort ...")
-    cohort, consort = _BUILDERS[intervention](cfg)
-    cohort, consort = _outcome_and_gate(cfg, intervention, cohort, consort)
+    all_cohorts, all_consort = [], []
 
-    # save cohort table
-    out = cfg.storage("cohorts")
-    out.mkdir(parents=True, exist_ok=True)
-    cohort.to_parquet(out / f"{intervention}.parquet")
+    for name in names:
+        t0 = time.time()
+        log(f"=== emulate[{name}] ===")
+        cohort, consort = _BUILDERS[name](cfg)
+        cohort, consort = _outcome_and_gate(cfg, name, cohort, consort)
+        cohort["intervention"] = name
 
-    # CONSORT -> cohorts.csv (long format, §7.6). Reset this intervention's prior
-    # consort rows first so re-runs don't accumulate stale duplicates (idempotent).
-    from src import results as R
-    from src.stages.estimate import _reset
-    _reset(cfg, "cohorts.csv", intervention, section="consort")
-    rows = [{"intervention": intervention, "section": "consort", "metric": step,
-             "stratum": "", "arm": "", "value": cnt, "support_count": cnt}
-            for step, cnt in consort]
-    R.append_rows(cfg, "cohorts.csv", rows)
+        # censoring indicator D, computed once and stored so every stage uses the same one
+        from src import features as F
+        horizon = int(cfg.get(f"interventions.{name}.horizon_days"))
+        cohort["observed_at_horizon"] = F.observed_at_horizon(cfg, cohort, horizon)
 
-    for step, cnt in consort:
-        log(f"  {step:42s} {cnt:>8,}")
-    ckpt.mark(intervention, n=len(cohort),
-              all_modality=int(cohort["all_modality"].sum()))
-    log(f"emulate[{intervention}] done in {time.time()-t0:,.0f}s "
-        f"-> {out/(intervention+'.parquet')}")
+        all_cohorts.append(cohort)
+        all_consort += [{"intervention": name, "section": "consort", "metric": step,
+                         "stratum": "", "arm": "", "value": cnt, "support_count": cnt}
+                        for step, cnt in consort]
+        for step, cnt in consort:
+            log(f"  {step:44s} {cnt:>9,}")
+        ckpt.mark(name, n=len(cohort), imaged=int(cohort["imaged"].sum()))
+        log(f"  emulate[{name}] done in {time.time()-t0:,.0f}s")
+
+    # ---- ONE consolidated cohort manifest ----
+    out = pd.concat(all_cohorts, ignore_index=True)
+    mdir = cfg.storage("manifests")
+    mdir.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(mdir / "cohorts.parquet", index=False)
+    log(f"cohorts.parquet: {len(out):,} rows across {out['intervention'].nunique()} interventions")
+
+    R.reset_rows(cfg, "cohorts.csv", section="consort")
+    R.append_rows(cfg, "cohorts.csv", all_consort)
+    log(f"emulate done -> {mdir/'cohorts.parquet'}")

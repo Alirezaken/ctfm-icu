@@ -1,30 +1,19 @@
-"""§9.12 / §6.8  external -- rerun the `structured` condition on eICU-CRD v2.0.
+"""external -- eICU-CRD replication. Structured only. Writes to effects.csv.
 
-External replication (§8): re-estimate each intervention's effect on a *different*
-ICU database, using the SAME estimand (eligibility, two strategies, mortality risk
-difference at the trial horizon) and the SAME estimator (cross-fitted AIPW, LightGBM
-nuisance, patient-level cluster bootstrap, same seed/indices count). Rows are written
-to effects.csv with dataset=eicu so they sit beside the MIMIC rows.
+Same target trials, same estimator, an entirely different population (208 US hospitals,
+not one Boston academic centre). If `structured` behaves the same way there, the finding
+is not a MIMIC quirk.
 
-eICU has no linked imaging and (here) no embedded notes, so only the `structured`
-condition is run; `plus_notes` stays pending an eICU note-embedding extraction
-(config external.conditions lists both). If a modality/arm is too thin to estimate,
-the intervention is logged and skipped rather than faked (no fabrication, §0).
+STRUCTURED ONLY, AND THAT IS NOT A GAP TO BE FILLED LATER.
+The public eICU-CRD release has no linked imaging and no usable free text. There is no
+eICU note-embedding stage to write. The previous plan carried `plus_notes` on eICU as
+"pending a GPU job"; that job would have produced nothing, because the data does not
+exist. Saying so is better than leaving a permanently-pending row in the results.
 
-OPERATIONALIZATION (documented design choices, analyst -> for Soroosh review; the
-estimand is fixed, only its eICU mapping is chosen here):
-  - Spine: one ICU unit stay per patient (uniquepid, first stay). Offsets are minutes
-    from unit admit. Age ">89"->90; drop age<=0/empty (§1).
-  - Outcome: in-hospital mortality (hospitaldischargestatus=Expired) occurring within
-    the trial horizon of t0. eICU is in-hospital only, so post-discharge death is not
-    observed -- a censoring caveat, noted; horizons here (28/90d) mostly precede
-    discharge for decedents.
-  - Structured covariates at t0: age, sex, admission weight + APACHE first-day
-    physiology (heart rate, MAP, resp rate, temp, WBC, sodium, pH, hematocrit,
-    creatinine, albumin, pO2, pCO2, BUN, glucose, bilirubin, FiO2). Treatment-derived
-    APACHE fields (intubated/vent/dialysis) are EXCLUDED to avoid arm leakage.
-  - Eligibility / arms per intervention: eICU diagnosis strings, treatment strings,
-    and labs, mirroring each config definition (see the per-intervention builders).
+CENSORING. eICU stops at hospital discharge, so vital status at t0+horizon is known only
+if the patient died in hospital within the horizon, or the stay itself reaches it. Someone
+discharged alive on day 5 with a 90-day horizon is CENSORED, not a survivor. Handled by
+IPCW, same as MIMIC.
 """
 from __future__ import annotations
 
@@ -241,81 +230,111 @@ def _structured_matrix(cohort, spine, aps):
     return X
 
 
-def _one(cfg, intervention, spine, aps, seed, folds, nboot):
-    iv = cfg.get(f"interventions.{intervention}")
-    horizon = int(iv["horizon_days"]) * 1440.0
-    ref = iv["rct_reference"]; ref_rd = ref["risk_difference"]; ref_lo, ref_hi = ref["ci"]
+
+
+def _one(cfg, intervention, spine, aps):
+    """One eICU intervention: build, estimate `naive` and `structured`, return rows."""
+    from src.stats import (cluster_bootstrap_indices, bootstrap_summary,
+                           influence_function_ci, divergence_z, ci_overlaps,
+                           minimum_detectable_effect, round3)
+    from src import estimator as EST
+
+    spec = cfg.get(f"interventions.{intervention}")
+    horizon_min = int(spec["horizon_days"]) * 1440.0
+    ref = spec["rct_reference"]
+    ref_rd = float(ref["risk_difference"])
+    ref_lo, ref_hi = [float(v) for v in ref["ci"]]
 
     coh = _BUILDERS[intervention](cfg, spine).drop_duplicates("patientunitstayid")
-    coh = coh.merge(spine[["patientunitstayid", "uniquepid", "died_hosp", "death_offset", "disp_known"]],
-                    on="patientunitstayid", how="inner").reset_index(drop=True)
+    coh = coh.merge(
+        spine[["patientunitstayid", "uniquepid", "died_hosp", "death_offset", "disp_known"]],
+        on="patientunitstayid", how="inner").reset_index(drop=True)
     if len(coh) < 50:
-        log(f"  {intervention}: eICU cohort too small (n={len(coh)}); skip"); return None
+        log(f"  {intervention}: eICU cohort too small (n={len(coh)}); skip")
+        return []
 
-    # outcome: in-hospital death within horizon of t0. eICU has no post-discharge
-    # follow-up, so status at the horizon is KNOWN only if the patient (a) died in
-    # hospital within the horizon, or (b) was still in hospital at t0+horizon (stay
-    # reaches it). Discharged alive BEFORE the horizon -> status unknown -> censored
-    # (D=0), handled by IPCW (§4, C5). This avoids counting early discharges as survivors.
-    stay_len = coh["death_offset"] - coh["t0_offset"]        # t0 -> hospital discharge (min)
-    died_within = (coh["died_hosp"] == 1) & (stay_len <= horizon)
+    # eICU has NO post-discharge follow-up. Status at the horizon is KNOWN only if the
+    # patient died in hospital within it, or the stay itself reaches it. Discharged alive
+    # before the horizon => status UNKNOWN => censored, handled by IPCW.
+    stay_len = coh["death_offset"] - coh["t0_offset"]
+    died_within = (coh["died_hosp"] == 1) & (stay_len <= horizon_min)
     Y = died_within.astype(int).to_numpy()
     A = (coh["arm"] == "active").astype(int).to_numpy()
-    D = (died_within | (stay_len >= horizon)).astype(int).to_numpy()
+    D = (died_within | (stay_len >= horizon_min)).astype(int).to_numpy()
+
     if A.min() == A.max() or Y.sum() < 10 or (A == 0).sum() < 20 or (A == 1).sum() < 20:
         log(f"  {intervention}: eICU arms/events too thin "
-            f"(n={len(coh)}, active={A.sum()}, deaths={Y.sum()}); skip"); return None
+            f"(n={len(coh)}, active={A.sum()}, deaths={Y.sum()}); skip")
+        return []
 
-    X = _structured_matrix(coh, spine, aps).to_numpy(dtype=float)
-    psi, keep, diag = aipw.crossfit_aipw(X, A, Y, folds, seed, D=D)
-    point = float(psi[keep].mean() * 100)
-    boot = list(cluster_bootstrap_indices(coh["uniquepid"].to_numpy(), nboot, seed))
-    bvals = [psi[b][keep[b]].mean() * 100 for b in boot]
-    eff = bootstrap_summary(point, bvals)
-    _, if_lo, if_hi = influence_function_ci(psi, keep)
-    bias = bootstrap_summary(point - ref_rd, [v - ref_rd for v in bvals])
-    log(f"  {intervention}: eICU n={len(coh)} active={A.sum()} deaths={Y.sum()} "
-        f"RD={point:.1f} [{eff.ci_low:.1f},{eff.ci_high:.1f}] ESS={round(diag['ess'])} "
-        f"cens={diag['frac_censored']*100:.1f}% inside_ref={ref_lo <= point <= ref_hi}")
-    return {
-        "intervention": intervention, "condition": "structured", "cohort": "eicu_all",
-        "dataset": "eicu", "method": "aipw",
-        **eff.as_row("effect_"), "effect_if_ci_low": if_lo, "effect_if_ci_high": if_hi,
-        "ref_rd": ref_rd, "ref_ci_low": ref_lo, "ref_ci_high": ref_hi,
-        **bias.as_row("bias_"), "inside_reference_ci": bool(ref_lo <= point <= ref_hi),
-        "negative_control_point": "", "negative_control_mean": "", "negative_control_std": "",
-        "negative_control_ci_low": "", "negative_control_ci_high": "",
-        "ci_width": round(eff.ci_high - eff.ci_low, 1),
-        "effective_sample_size": round(diag["ess"]),
-    }
+    S = np.nan_to_num(_structured_matrix(coh, spine, aps).to_numpy(dtype=float), nan=0.0)
+    boot = cluster_bootstrap_indices(coh["uniquepid"].to_numpy(), cfg.nboot, cfg.seed)
+    log(f"  {intervention}: n={len(coh):,} active={A.sum():,} deaths={Y.sum():,} "
+        f"censored={100*(D==0).mean():.1f}%")
+
+    rows = []
+    for name in (cfg.get("external.conditions") or ["naive", "structured"]):
+        X = np.ones((len(Y), 1)) if name == "naive" else S
+        psi, keep, diag = EST.crossfit_aipw(X, A, Y, cfg.folds, cfg.seed,
+                                            trim=cfg.trim, D=D)
+        pt = float(psi[keep].mean() * 100)
+        bt = np.array([psi[b][keep[b]].mean() * 100 for b in boot])
+        e = bootstrap_summary(pt, bt)
+        _, if_lo, if_hi, se = influence_function_ci(psi, keep)
+        ato_b = np.array([EST.ato_from_boot(diag["psi_ato"], diag["h_ato"], b) for b in boot])
+        ato = bootstrap_summary(diag["ato"], ato_b)
+        bias = bootstrap_summary(pt - ref_rd, bt - ref_rd)
+
+        rows.append({
+            "intervention": intervention, "condition": name, "cohort": "eicu_all",
+            "dataset": "eicu",
+            "estimator": "aipw" if name != "naive" else "unadjusted", "reduction": "",
+            **e.as_row("effect_"),
+            "effect_if_ci_low": if_lo, "effect_if_ci_high": if_hi,
+            **ato.as_row("ato_"),
+            "ref_rd": ref_rd, "ref_ci_low": ref_lo, "ref_ci_high": ref_hi,
+            "ref_source": str(ref.get("source")),
+            **bias.as_row("bias_"),
+            "divergence_z": divergence_z(pt, se or 0.0, ref_rd, (ref_lo, ref_hi)),
+            "ci_overlaps_rct": ci_overlaps((e.ci_low, e.ci_high), (ref_lo, ref_hi)),
+            "ci_width": round(e.ci_high - e.ci_low, 1),
+            "effective_sample_size": round(diag["ess"]),
+            "propensity_min": round3(diag["e_min"]), "propensity_max": round3(diag["e_max"]),
+            "frac_trimmed": round3(diag["frac_trimmed"]),
+            "frac_censored": round3(diag["frac_censored"]),
+            "n_analyzed": diag["n"], "n_active": int(A.sum()),
+            "n_comparator": int((A == 0).sum()), "n_events": int(Y.sum()),
+            "min_detectable_effect_pp": minimum_detectable_effect(psi, keep),
+        })
+        log(f"    {name:12s} RD={pt:7.1f}  CI[{e.ci_low:6.1f},{e.ci_high:6.1f}]  "
+            f"bias={pt-ref_rd:+6.1f}  ESS={round(diag['ess'])}")
+    return rows
 
 
-def run(cfg, force: bool = False):
+def run(cfg, force: bool = False, intervention: str = None):
+    from src import results as R
+
     eicu = cfg.input("eicu_dir")
     if not eicu.exists():
-        die(f"eICU not present at {eicu}. Upload eICU-CRD v2.0 first.")
+        log(f"eICU not present at {eicu}; skipping external replication")
+        return
+
     t0 = time.time()
-    seed = int(cfg.get("run.seed", 42))
-    folds = int(cfg.get("estimator.cross_fitting_folds", 5))
-    nboot = int(cfg.get("bootstrap.n_resamples", 10000))
-    log(f"external[eICU]: structured replication, seed={seed} folds={folds} boot={nboot}")
+    ext = cfg.get("external") or {}
+    names = [intervention] if intervention else ext.get("interventions", [])
+    names = [n for n in names if n in _BUILDERS]
+    log(f"=== external[eICU]: structured replication for {names} ===")
 
     spine = _spine(cfg)
     aps = _aps(cfg)
-    log(f"  eICU spine: {len(spine):,} patients; APACHE physiology for {len(aps):,} stays")
 
     rows = []
-    for iv in _BUILDERS:
-        r = _one(cfg, iv, spine, aps, seed, folds, nboot)
-        if r:
-            rows.append(r)
+    for iv in names:
+        try:
+            rows += _one(cfg, iv, spine, aps)
+        except Exception as e:
+            log(f"  {iv}: eICU failed ({e}); skip")
 
-    # idempotent: drop prior eICU rows, keep MIMIC rows, append fresh
-    p = cfg.storage("results", "effects.csv")
-    if p.exists():
-        df = pd.read_csv(p)
-        if "dataset" in df.columns:
-            df[df["dataset"] != "eicu"].to_csv(p, index=False)
+    R.reset_rows(cfg, "effects.csv", dataset="eicu")
     R.append_rows(cfg, "effects.csv", rows)
-    log(f"external[eICU] done in {time.time()-t0:,.0f}s -> {len(rows)} structured rows "
-        f"(dataset=eicu). plus_notes pending eICU note embeddings.")
+    log(f"external done in {time.time()-t0:,.0f}s -> effects.csv ({len(rows)} eICU rows)")

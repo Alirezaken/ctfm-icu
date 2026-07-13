@@ -3,13 +3,14 @@ pandas>=2.0
 pyarrow>=14
 numpy>=1.24
 
-# Causal layer (config, estimator, stats) -- §0, §5, §8
+# Causal layer: config, estimator, statistics
 pyyaml>=6.0
-lightgbm>=4.0        # GBT nuisance models for cross-fitted AIPW
-scikit-learn>=1.3    # cross-fitting, metrics (AUROC/AUPRC), calibration
-scipy>=1.11          # statistical tests / distributions
+lightgbm>=4.0        # nuisance models for cross-fitted AIPW / TMLE
+scikit-learn>=1.3    # cross-fitting, AUROC/AUPRC, isotonic calibration, PCA
+scipy>=1.11          # distributions, tests
 
-# Embeddings (the one GPU stage) -- §3. Install on the GPU node only.
-# torch                # RAD-DINO + Clinical-Longformer inference
-# transformers         # microsoft/rad-dino, yikuan8/Clinical-Longformer
-# pillow               # image resize 512->224
+# Embeddings -- the ONE GPU stage. Install on the GPU node only.
+# torch
+# transformers       # microsoft/rad-dino, yikuan8/Clinical-Longformer
+# pillow             # image resize
+# open_clip_torch    # BiomedCLIP, for the encoder-swap robustness only (optional)

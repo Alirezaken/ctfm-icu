@@ -1,13 +1,11 @@
-"""§9.3  link -- MIMIC-IV intersect MIMIC-CXR linkage.
+"""link -- verify the relational link layer is present and complete.
 
-The relational link layer is already built by pipeline/build_link_layer.py into
-paths.link_dir (patients, admissions, icu_stays, ed_stays, cxr_studies,
-cohort_index). This stage verifies it is present and complete, records linkage
-counts for the manifest, and is where the project-wide time-zero discipline
-assertion will be wired in once cohorts define their time zeros.
+Built by pipeline/build_link_layer.py. This stage does not rebuild it; it checks that the
+tables the study actually reads exist, and records their row counts.
 
-It does NOT rebuild the link layer (that is the existing pipeline's job); it
-reuses it so the only heavy data pass stays where it already ran.
+Only three of the six link tables are read downstream (patients, icu_stays, cxr_studies).
+The other three are built and never used. That is fine and worth knowing, so it is logged
+rather than quietly ignored.
 """
 from __future__ import annotations
 
@@ -15,35 +13,37 @@ import pandas as pd
 
 from src.util import log, die, Checkpoint
 
-_REQUIRED = [
-    "patients.csv", "admissions.csv", "icu_stays.csv",
-    "ed_stays.csv", "cxr_studies.csv", "cohort_index.csv",
-]
+_REQUIRED = ["patients.csv", "icu_stays.csv", "cxr_studies.csv"]
+_BUILT_UNUSED = ["admissions.csv", "ed_stays.csv", "cohort_index.csv"]
 
 
-def run(cfg, force: bool = False):
+def run(cfg, force: bool = False, intervention: str = None):
     ckpt = Checkpoint(cfg, "link")
-    link_dir = cfg.input("link_dir")
+    d = cfg.input("link_dir")
 
-    missing = [f for f in _REQUIRED if not (link_dir / f).exists()]
+    missing = [f for f in _REQUIRED if not (d / f).exists()]
     if missing:
-        die(f"link layer incomplete in {link_dir}: missing {missing}. "
+        die(f"link layer incomplete in {d}: missing {missing}. "
             f"Build it first: python pipeline/build_link_layer.py")
 
     if ckpt.done("verified") and not force:
-        log(f"link layer already verified at {link_dir} (use --force to re-check)")
+        log(f"link layer verified at {d} (use --force to re-check)")
         return
 
     counts = {}
     for f in _REQUIRED:
-        n = sum(1 for _ in open(link_dir / f)) - 1  # minus header
+        n = sum(1 for _ in open(d / f)) - 1
         counts[f] = n
-        log(f"  {f:18s} {n:>9,} rows")
+        log(f"  {f:20s} {n:>10,} rows   [used]")
+    for f in _BUILT_UNUSED:
+        if (d / f).exists():
+            log(f"  {f:20s} {'':>10s}   [built, not read by the analysis]")
 
-    # all-modality cohort spine: who has EHR + CXR (note/image gating happens at
-    # cohort build, against the embeddings).
-    cohort = pd.read_csv(link_dir / "cohort_index.csv")
-    log(f"  cohort_index columns: {list(cohort.columns)}")
+    cxr = pd.read_csv(d / "cxr_studies.csv", nrows=1)
+    need = {"subject_id", "study_datetime", "views", "edema"}
+    absent = need - set(cxr.columns)
+    if absent:
+        die(f"cxr_studies.csv is missing required columns: {sorted(absent)}")
 
     ckpt.mark("verified", counts=counts)
     log("link verified.")

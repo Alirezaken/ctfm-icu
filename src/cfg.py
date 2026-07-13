@@ -43,18 +43,12 @@ class Config:
     def __init__(self, data: dict, path: Path):
         self._d = data
         self.path = path
-        # embedding reduction: default comes from config (decision 4 = 'score');
-        # a --variant may override it (e.g. 'raw'/'pca' sensitivity runs).
         self.reduction = self.get("estimator.embedding_reduction", "none")
         self.pca_components = int(self.get("estimator.pca_components", 30))
-        self._results_override = None  # variant results dir override
-
-    def apply_variant(self, results_dir: str, reduction: str, pca_components: int = 30):
-        """Overlay a fix variant: change how embeddings enter + where results go.
-        Leaves config.yaml (Soroosh's spec) and the canonical results/ untouched."""
-        self._results_override = results_dir
-        self.reduction = reduction
-        self.pca_components = pca_components
+        self.folds = int(self.get("estimator.cross_fitting_folds", 5))
+        self.seed = int(self.get("run.seed", 42))
+        self.trim = float(self.get("estimator.trim", 0.01))
+        self.nboot = int(self.get("bootstrap.n_resamples", 2000))
 
     def __getitem__(self, key):
         return self._d[key]
@@ -97,8 +91,6 @@ class Config:
         """Absolute path under storage_root for a named subdir, e.g.
         cfg.storage('results', 'effects.csv')."""
         sub = self.get(f"paths.{subkey}", subkey)
-        if subkey == "results" and self._results_override:
-            sub = self._results_override            # variant writes to its own dir
         return self.storage_root.joinpath(sub, *parts)
 
     def input(self, subkey: str) -> Path:

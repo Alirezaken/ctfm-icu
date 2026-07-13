@@ -1,164 +1,193 @@
-"""§9.13 / §7  consolidate -- assemble the cross-stage result files.
+"""consolidate -- every PAIRED contrast, with p-values and FDR. Writes contrasts.csv + manifest.csv.
 
-Writes the 10 exact-schema templates + manifest, then computes the tables derived
-from the per-condition estimates + their paired bootstrap replicates (saved by
-`estimate` as results/_boot_<intervention>.npz):
+contrasts.csv is the ONLY file in the study with p-values. Five families, all computed
+from the SHARED cluster-bootstrap indices saved by `estimate`, so every contrast is PAIRED:
+the same patients, resampled the same way, under both conditions.
 
-  - dissociation.csv  (§7.2) specificity grid: bias reduction vs `structured` from
-    each added modality.
-  - decomposition.csv (§7.3) modality decomposition: marginal + complementary
-    (non-overlapping) bias reduction per modality (notes_variant=clinical; notes_all
-    needs a second estimate run).
-  - comparisons.csv   (§7.9) the ONLY p-values file: key contrasts (effect vs RCT
-    reference, and each modality's bias reduction) via the cluster bootstrap, with
-    Benjamini-Hochberg FDR across the family.
+Pairing is not a technicality here, it is what makes the paper's null decisive. The
+marginal CI on any single condition's risk difference is wide (the cohorts are a few
+thousand patients with poor overlap). But the CI on the DIFFERENCE between two conditions
+estimated on the SAME patients is far narrower, because the shared sampling noise cancels.
+That is what lets us say "we can rule out a bias reduction larger than X pp" instead of
+the much weaker "we failed to find one".
 
-Reads/writes the active variant's results dir, so re-running under --variant <fix>
-reproduces every table under that method. Bias = effect - RCT reference (pp);
-"bias reduction" = |bias_structured| - |bias_condition| (positive = closer to ref).
+  1. bias_reduction_{modality}   |bias(structured)| - |bias(struct_<modality>)|
+                                 THE PRIMARY OUTCOME. Positive = the modality moved the
+                                 estimate closer to the RCT truth.
+  2. effect_vs_reference         does this condition's effect differ from the trial?
+  3. multimodal_vs_expert        does the kitchen-sink multimodal set beat the
+                                 clinician-curated one? (the design-based competitor)
+  4. marginal/complementary      modality decomposition: what does each modality add on its
+                                 own, and what does it add ON TOP OF the other two?
+  5. subgroup_diff               do subgroup effects differ from each other?
+
+Every contrast carries its minimum detectable effect, so a null row states what it could
+have found, not merely that it found nothing.
 """
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 
 from src import results as R
-from src.stats import bootstrap_summary, benjamini_hochberg
+from src.stats import (bootstrap_summary, benjamini_hochberg, bootstrap_p_two_sided,
+                       minimum_detectable_bias_reduction)
 from src.util import log
 
-_MOD = {"plus_notes": "notes", "plus_imaging_only": "imaging", "full": "full"}
-
-
-def _p_two_sided(boot_diff):
-    """Bootstrap two-sided p-value for H0: quantity = 0."""
-    b = np.asarray(boot_diff, float)
-    b = b[np.isfinite(b)]
-    n = max(len(b), 1)
-    p = 2.0 * min((b >= 0).mean(), (b <= 0).mean())
-    return float(min(max(p, 1.0 / n), 1.0))
-
-
-def _load_boot(path):
-    b = np.load(path, allow_pickle=True)
-    conds = [str(c) for c in b["conditions"]]
-    return {"ref": float(b["ref_rd"]),
-            "pt": {c: float(p) for c, p in zip(conds, b["point"])},
-            "bt": {c: b[c] for c in conds}, "conds": conds}
+_MOD = {"struct_img": "images", "struct_radtext": "radtext", "struct_histnote": "histnote"}
 
 
 def _absbias(x, ref):
-    return np.abs(np.asarray(x) - ref)
+    return np.abs(np.asarray(x, float) - ref)
 
 
-def run(cfg, force: bool = False):
+def run(cfg, force: bool = False, intervention: str = None):
     R.write_templates(cfg, force=force)
     R.build_manifest(cfg)
 
-    results_dir = cfg.storage("results")
-    boot_files = sorted(results_dir.glob("_boot_*.npz"))
-    diss, decomp, comp = [], [], []
+    rdir = cfg.storage("results")
+    rows = []
 
-    for bf in boot_files:
+    for bf in sorted(rdir.glob("_boot_*.npz")):
         iv = bf.name[len("_boot_"):-len(".npz")]
-        d = _load_boot(bf)
-        ref, pt, bt = d["ref"], d["pt"], d["bt"]
+        b = np.load(bf, allow_pickle=True)
+        conds = [str(c) for c in b["conditions"]]
+        ref = float(b["ref_rd"])
+        pt = {c: float(p) for c, p in zip(conds, b["point"])}
+        bt = {c: np.asarray(b[c], float) for c in conds}
+
         if "structured" not in bt:
             continue
-        bias0_pt = abs(pt["structured"] - ref)
-        bias0_bt = _absbias(bt["structured"], ref)
+        base_pt = abs(pt["structured"] - ref)
+        base_bt = _absbias(bt["structured"], ref)
 
-        # --- dissociation: bias reduction vs structured, per added modality ---
+        # ---- 1. bias reduction per modality (THE PRIMARY OUTCOME) ----
         for cond, mod in _MOD.items():
             if cond not in bt:
                 continue
-            red_pt = bias0_pt - abs(pt[cond] - ref)
-            red_bt = bias0_bt - _absbias(bt[cond], ref)
-            diss.append({"intervention": iv, "modality": mod,
-                         **bootstrap_summary(red_pt, red_bt).as_row("bias_reduction_vs_structured_")})
-            comp.append({"comparison": f"bias_reduction_{mod}_vs_structured",
-                         "intervention": iv, "stratum": "",
-                         "test": "cluster_bootstrap", "statistic": round(red_pt, 3),
-                         "p_raw": _p_two_sided(red_bt), "p_fdr": None})
+            red_pt = base_pt - abs(pt[cond] - ref)
+            red_bt = base_bt - _absbias(bt[cond], ref)
+            e = bootstrap_summary(red_pt, red_bt)
+            rows.append({
+                "contrast": "bias_reduction", "intervention": iv, "modality": mod,
+                "stratum": "", **e.as_row("value_"),
+                "min_detectable_pp": minimum_detectable_bias_reduction(red_bt),
+                "test": "paired_cluster_bootstrap",
+                "p_raw": bootstrap_p_two_sided(red_bt), "p_fdr": None})
 
-        # --- decomposition: marginal + complementary, notes & imaging, BOTH note
-        #     variants (§6.3): 'clinical' (radiology-excluded, primary per B1) from the
-        #     headline plus_notes/full, and 'all' (radiology-inclusive) from _all.
-        for variant, pn, fu in [("clinical", "plus_notes", "full"),
-                                ("all", "plus_notes_all", "full_all")]:
-            if not ({pn, "plus_imaging_only", fu} <= set(bt)):
-                continue
-            for mod, own, other in [("notes", pn, "plus_imaging_only"),
-                                    ("imaging", "plus_imaging_only", pn)]:
-                marg_pt = bias0_pt - abs(pt[own] - ref)
-                marg_bt = bias0_bt - _absbias(bt[own], ref)
-                comp_pt = abs(pt[other] - ref) - abs(pt[fu] - ref)   # added on top of the other
-                comp_bt = _absbias(bt[other], ref) - _absbias(bt[fu], ref)
-                decomp.append({"intervention": iv, "modality": mod, "notes_variant": variant,
-                               **bootstrap_summary(marg_pt, marg_bt).as_row("marginal_bias_reduction_"),
-                               **bootstrap_summary(comp_pt, comp_bt).as_row("complementary_bias_reduction_")})
+        if "multimodal" in bt:
+            red_pt = base_pt - abs(pt["multimodal"] - ref)
+            red_bt = base_bt - _absbias(bt["multimodal"], ref)
+            e = bootstrap_summary(red_pt, red_bt)
+            rows.append({
+                "contrast": "bias_reduction", "intervention": iv, "modality": "multimodal",
+                "stratum": "", **e.as_row("value_"),
+                "min_detectable_pp": minimum_detectable_bias_reduction(red_bt),
+                "test": "paired_cluster_bootstrap",
+                "p_raw": bootstrap_p_two_sided(red_bt), "p_fdr": None})
 
-        # --- comparisons: each condition's effect vs the RCT reference ---
-        for cond in d["conds"]:
-            diff_bt = np.asarray(bt[cond]) - ref
-            comp.append({"comparison": f"effect_vs_reference[{cond}]",
-                         "intervention": iv, "stratum": "",
-                         "test": "cluster_bootstrap", "statistic": round(pt[cond] - ref, 3),
-                         "p_raw": _p_two_sided(diff_bt), "p_fdr": None})
+        # ---- 2. each condition's effect vs the RCT reference ----
+        for c in conds:
+            d = bt[c] - ref
+            e = bootstrap_summary(pt[c] - ref, d)
+            rows.append({
+                "contrast": "effect_vs_reference", "intervention": iv, "modality": c,
+                "stratum": "", **e.as_row("value_"),
+                "min_detectable_pp": minimum_detectable_bias_reduction(d),
+                "test": "paired_cluster_bootstrap",
+                "p_raw": bootstrap_p_two_sided(d), "p_fdr": None})
 
-        # --- C6: full vs design_based (the paper's expert baseline) ---
-        if {"full", "design_based"} <= set(bt):
-            dd = np.asarray(bt["full"]) - np.asarray(bt["design_based"])
-            comp.append({"comparison": "full_vs_design_based", "intervention": iv,
-                         "stratum": "", "test": "cluster_bootstrap",
-                         "statistic": round(pt["full"] - pt["design_based"], 3),
-                         "p_raw": _p_two_sided(dd), "p_fdr": None})
+        # ---- 3. multimodal vs the expert (design-based) competitor ----
+        if "multimodal" in bt and "expert" in bt:
+            d_pt = abs(pt["expert"] - ref) - abs(pt["multimodal"] - ref)
+            d_bt = _absbias(bt["expert"], ref) - _absbias(bt["multimodal"], ref)
+            e = bootstrap_summary(d_pt, d_bt)
+            rows.append({
+                "contrast": "multimodal_vs_expert", "intervention": iv,
+                "modality": "multimodal", "stratum": "", **e.as_row("value_"),
+                "min_detectable_pp": minimum_detectable_bias_reduction(d_bt),
+                "test": "paired_cluster_bootstrap",
+                "p_raw": bootstrap_p_two_sided(d_bt), "p_fdr": None})
 
-    # --- C6: subgroup-difference p-values (full condition), from demographics boots ---
-    for df_ in sorted(results_dir.glob("_demoboot_*.npz")):
-        iv = df_.name[len("_demoboot_"):-len(".npz")]
-        b = np.load(df_, allow_pickle=True)
-        by_type = {}
-        for key in b.files:
-            stype, sname = key.split("|", 1)
-            by_type.setdefault(stype, []).append((sname, b[key]))
-        for stype, levels in by_type.items():
-            if len(levels) < 2:
-                continue
-            (n0, b0), (n1, b1) = levels[0], levels[-1]     # sex F vs M; age first vs last band
-            diff = np.asarray(b1) - np.asarray(b0)
-            comp.append({"comparison": f"subgroup_diff[{stype}:{n1}-{n0}]", "intervention": iv,
-                         "stratum": stype, "test": "cluster_bootstrap",
-                         "statistic": round(float(b1.mean() - b0.mean()), 3),
-                         "p_raw": _p_two_sided(diff), "p_fdr": None})
+        # ---- 4. decomposition: what each modality adds ON TOP OF the others ----
+        if "multimodal" in bt:
+            for cond, mod in _MOD.items():
+                if cond not in bt:
+                    continue
+                others = [c for c in _MOD if c != cond and c in bt]
+                if not others:
+                    continue
+                # complementary = what `mod` adds once the OTHER modalities are already in.
+                # Approximated by (best other single) -> multimodal. If the modality is
+                # redundant with the others, this is ~0 even when its marginal effect is not.
+                best_other = min(others, key=lambda c: abs(pt[c] - ref))
+                comp_pt = abs(pt[best_other] - ref) - abs(pt["multimodal"] - ref)
+                comp_bt = _absbias(bt[best_other], ref) - _absbias(bt["multimodal"], ref)
+                e = bootstrap_summary(comp_pt, comp_bt)
+                rows.append({
+                    "contrast": "complementary_bias_reduction", "intervention": iv,
+                    "modality": mod, "stratum": "", **e.as_row("value_"),
+                    "min_detectable_pp": minimum_detectable_bias_reduction(comp_bt),
+                    "test": "paired_cluster_bootstrap",
+                    "p_raw": bootstrap_p_two_sided(comp_bt), "p_fdr": None})
 
-    # BH-FDR across the whole comparisons family (§8 Kind C)
-    if comp:
-        p = benjamini_hochberg([r["p_raw"] for r in comp])
-        for r, pf in zip(comp, p):
+    # ---- 5. subgroup differences, read back from robustness.csv ----
+    rows += _subgroup_contrasts(cfg)
+
+    if rows:
+        p = benjamini_hochberg([r["p_raw"] for r in rows])
+        for r, pf in zip(rows, p):
             r["p_fdr"] = float(pf)
 
-    for fname, rows in [("dissociation.csv", diss), ("decomposition.csv", decomp),
-                        ("comparisons.csv", comp)]:
-        path = cfg.storage("results", fname)
-        if path.exists():
-            path.unlink()
-        R.append_rows(cfg, fname, rows)
-        log(f"  {fname}: {len(rows)} rows")
+    R.reset_rows(cfg, "contrasts.csv", contrast=[
+        "bias_reduction", "effect_vs_reference", "multimodal_vs_expert",
+        "complementary_bias_reduction", "subgroup_diff"])
+    R.append_rows(cfg, "contrasts.csv", rows)
+    log(f"consolidate done -> contrasts.csv ({len(rows)} contrasts), manifest.csv")
 
-    # a fix-variant dir needs the variant-INDEPENDENT outputs too (image quality gate;
-    # CONSORT counts) so it is a complete, comparable 10-file set. Copy them from the
-    # canonical results/ (they don't depend on the embedding reduction).
-    if cfg._results_override:
-        import shutil
-        canon = cfg.storage_root / cfg.get("paths.results", "results")
-        if (canon / "probe.csv").exists():
-            shutil.copy(canon / "probe.csv", results_dir / "probe.csv")
-        # merge canonical CONSORT rows into the variant cohorts.csv (keep its overlap_ess)
-        cvar, ccanon = results_dir / "cohorts.csv", canon / "cohorts.csv"
-        if ccanon.exists() and cvar.exists():
-            import pandas as pd
-            a = pd.read_csv(cvar); b = pd.read_csv(ccanon)
-            consort = b[b["section"] != "overlap_ess"]
-            pd.concat([consort, a], ignore_index=True).to_csv(cvar, index=False)
-        log("  copied variant-independent outputs (probe, CONSORT) from canonical results/")
 
-    log(f"consolidate done -> {results_dir} ({len(boot_files)} intervention(s)).")
+def _subgroup_contrasts(cfg):
+    """Pairwise subgroup differences within each (intervention, condition, subgroup_type).
+
+    Read from robustness.csv rather than recomputed, so the numbers cannot drift between
+    the two files. `undefined` subgroups are skipped, not silently treated as zero.
+    """
+    p = cfg.storage("results", "robustness.csv")
+    if not p.exists():
+        return []
+    df = pd.read_csv(p)
+    df = df[(df["family"] == "subgroup") & (df["undefined"] != True)]  # noqa: E712
+    if not len(df):
+        return []
+
+    rows = []
+    df = df.copy()
+    df["stype"] = df["subgroup"].astype(str).str.split(":").str[0]
+    df["sname"] = df["subgroup"].astype(str).str.split(":").str[1]
+
+    for (iv, cond, stype), g in df.groupby(["intervention", "condition", "stype"]):
+        g = g.dropna(subset=["value_point", "value_std"])
+        if len(g) < 2:
+            continue
+        # compare each subgroup against the first, on a normal approximation from the
+        # bootstrap SDs (the subgroups are disjoint patient sets, so the estimates are
+        # independent and their variances add)
+        base = g.iloc[0]
+        for _, r in g.iloc[1:].iterrows():
+            diff = float(r["value_point"]) - float(base["value_point"])
+            se = float(np.sqrt(float(r["value_std"]) ** 2 + float(base["value_std"]) ** 2))
+            if se <= 0:
+                continue
+            from scipy.stats import norm
+            pval = float(2 * (1 - norm.cdf(abs(diff / se))))
+            rows.append({
+                "contrast": "subgroup_diff", "intervention": iv, "modality": cond,
+                "stratum": f"{stype}:{r['sname']}-{base['sname']}",
+                "value_point": round(diff, 1), "value_mean": round(diff, 1),
+                "value_std": round(se, 1),
+                "value_ci_low": round(diff - 1.96 * se, 1),
+                "value_ci_high": round(diff + 1.96 * se, 1),
+                "min_detectable_pp": round(2.8 * se, 2),
+                "test": "normal_approx_on_bootstrap_sd",
+                "p_raw": pval, "p_fdr": None})
+    return rows
