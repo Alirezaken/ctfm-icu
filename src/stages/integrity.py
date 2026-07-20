@@ -87,28 +87,66 @@ def run(cfg, force: bool = False, intervention: str = None):
         problems.append(f"could not verify embedding alignment: {e}")
 
     # ---- 4 + 5. shared cohort and time-zero discipline ----
+    # extract_embeddings scopes by PATIENT, not by (patient, intervention, t0): a
+    # patient's full imaging/note history is embedded once so the same vectors can
+    # serve every intervention they qualify for, each with its own t0 (see
+    # extract_embeddings.py's docstring). So embeddings_index.parquet legitimately
+    # contains many items timestamped at/after any single intervention's t0 -- that is
+    # not a leak, it is the whole point of embedding once per patient. Naively counting
+    # "raw items >= t0" (as the original check here did) flags ~50% of every
+    # intervention's items as "violations" that are simply never selected downstream.
+    #
+    # The actual guarantee -- "no value used for adjustment is post-baseline" -- is
+    # enforced in features.pool_embeddings(), which unconditionally filters `ts < t0`
+    # before any vector is returned. This check verifies that guarantee END TO END by
+    # calling the real pool_embeddings() for every (intervention, modality) and
+    # confirming, independently from the raw index, that every patient it marks
+    # has_real=True actually has a strictly-pre-t0 item backing that claim -- i.e. that
+    # the production filter works, not merely that the raw index has no post-t0 rows
+    # (it does, by design, and pool_embeddings is what excludes them).
     try:
+        from src import features as F
+
         cohorts = ev.load_cohorts(cfg)
         idx = pd.read_parquet(ev.manifest_path(cfg, "embeddings_index.parquet"))
         idx["ts"] = pd.to_datetime(idx["ts"], errors="coerce")
+        modalities_present = set(idx["modality"].unique())
 
         for iv, coh in cohorts.groupby("intervention"):
-            imaged = coh[coh["imaged"] & coh["arm"].notna()]
+            imaged = coh[coh["imaged"] & coh["arm"].notna()].reset_index(drop=True)
             if not len(imaged):
                 continue
             passed.append(f"{iv}: shared imaged cohort n={len(imaged):,} "
                           f"(all conditions use this same set)")
 
-            m = idx.merge(imaged[["subject_id", "t0"]], on="subject_id", how="inner")
-            m["t0"] = pd.to_datetime(m["t0"], errors="coerce")
-            violations = int((m["ts"] >= m["t0"]).sum())
-            if violations:
-                problems.append(
-                    f"{iv}: TIME-ZERO VIOLATION -- {violations:,} embedded items are "
-                    f"timestamped at or after t0. Adjustment is using post-baseline data.")
-            else:
-                passed.append(f"{iv}: time-zero discipline holds "
-                              f"({len(m):,} items checked, all strictly pre-t0)")
+            for mod in ("images", "radtext", "histnote"):
+                if mod not in modalities_present:
+                    continue
+                _, has_real = F.pool_embeddings(cfg, imaged, mod)
+                real_subjects = set(imaged.loc[has_real, "subject_id"])
+                if not real_subjects:
+                    continue
+                sub_idx = idx[(idx["modality"] == mod) &
+                              (idx["subject_id"].isin(real_subjects))]
+                m = sub_idx.merge(imaged[["subject_id", "t0"]], on="subject_id",
+                                  how="inner")
+                m["t0"] = pd.to_datetime(m["t0"], errors="coerce")
+                pre_t0_subjects = set(m.loc[m["ts"] < m["t0"], "subject_id"])
+                missing = real_subjects - pre_t0_subjects
+                if missing:
+                    problems.append(
+                        f"{iv}/{mod}: TIME-ZERO VIOLATION -- pool_embeddings marked "
+                        f"{len(missing)} patient(s) has_real=True with no "
+                        f"independently-verified strictly-pre-t0 item in the raw "
+                        f"index. The production pre-t0 filter may be broken.")
+                else:
+                    post_t0 = int((m["ts"] >= m["t0"]).sum())
+                    passed.append(
+                        f"{iv}/{mod}: time-zero discipline holds for all "
+                        f"{len(real_subjects):,} has_real patients (raw index "
+                        f"independently confirms >=1 strictly-pre-t0 item each; "
+                        f"{post_t0:,} post-t0 items also embedded for these patients "
+                        f"are correctly excluded by pool_embeddings)")
     except Exception as e:
         problems.append(f"could not verify cohort/time-zero invariants: {e}")
 

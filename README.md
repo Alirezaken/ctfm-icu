@@ -1,150 +1,55 @@
-# Multimodal Adjustment for ICU Treatment-Effect Estimation
+# RCT-Anchored Audit of Multimodal Causal Adjustment in the ICU
 
-Causal inference pipeline that estimates treatment effects for four ICU
-interventions using observational MIMIC-IV data, and validates the estimates
-against published randomized trial results. The core question: do frozen
-chest X-ray and clinical-note embeddings, used as adjustment covariates,
-reduce confounding bias beyond what structured data alone can achieve?
+**Thesis:** a validated embedding is not a valid confounder proxy. Foundation-model image
+and text embeddings are highly informative about the confounders they are meant to proxy,
+yet they reduce confounding bias by zero, because the information is already in the
+structured record. Meanwhile they destroy positivity. **Overlap, not proxy richness, is the
+binding constraint on EHR causal inference.**
 
-## Overview
+## What this is
+Four ICU target trials anchored to real RCTs (PROSEVA, CLOVERS/CLASSIC, STARRT-AKI, TRISS),
+seven adjustment conditions, cross-fitted doubly-robust estimation, and a pre-estimation
+diagnostic that predicts whether any candidate modality will help — validated against both
+RCT ground truth and a semi-synthetic benchmark with known effects.
 
-The pipeline emulates each intervention as a target trial inside MIMIC-IV,
-estimates the effect under six covariate adjustment conditions (none →
-structured → notes → imaging → all three → expert-curated), and compares
-each estimate to the corresponding RCT risk difference. The effect measure is
-the risk difference at the trial horizon, in percentage points.
+## Layout
+```
+config.yaml          the study design. SINGLE SOURCE OF TRUTH.
+main.py              the only entry point
+pipeline/            data prep: link layer + event stream (run once)
+src/
+  cfg.py             config loader
+  events.py          event-stream, link-layer and manifest readers
+  features.py        structured covariates, expert set, censoring, embedding pooling
+  estimator.py       cross-fitted AIPW/TMLE, NESTED reduction, IPCW, overlap weights (ATO)
+  diagnostic.py      THE CONTRIBUTION: incremental confounding (dAUC_A, dAUC_Y, ICI)
+  synthetic.py       semi-synthetic benchmark: real data, simulated A/Y, known tau
+  stats.py           one definition of every statistic; Kind A/B/C kept separate
+  results.py         the 7 output schemas
+  stages/            the 11 pipeline stages, in dependency order
+```
 
-**Interventions and reference trials**
+## Run
+```bash
+python main.py --list
+python main.py --stage all          # every stage, all four interventions
+```
+Every per-intervention stage runs **all four** interventions by default.
 
-| Intervention | Design role | Reference trial(s) |
-|---|---|---|
-| Prone positioning vs supine (severe ARDS) | Positive control | PROSEVA |
-| Conservative vs liberal fluids (sepsis) | Null calibration | CLOVERS, CLASSIC |
-| Early vs delayed renal replacement therapy (AKI) | Null calibration | STARRT-AKI |
-| Restrictive vs liberal transfusion threshold | Null calibration | TRICC, TRISS |
-
-**Adjustment conditions** (all on the shared all-modality cohort)
-
-| Condition | Covariates |
+## The three modalities, named for what they are
+| Channel | Reality |
 |---|---|
-| `naive` | None |
-| `structured` | Vitals, labs, demographics at time zero |
-| `plus_notes` | Structured + Clinical-Longformer note embeddings |
-| `plus_imaging_only` | Structured + RAD-DINO image embeddings |
-| `full` | Structured + notes + images |
-| `design_based` | Expert-curated structured confounder set |
+| `images` | pre-t0 frontal CXR (RAD-DINO) |
+| `radtext` | pre-t0 **radiology reports** — contemporaneous expert text |
+| `histnote` | pre-t0 **prior-admission discharge summaries** — MIMIC-IV-Note has no nursing/progress notes, so a discharge summary before t0 is necessarily from an earlier hospitalization |
 
-**Estimator**: cross-fitted AIPW with LightGBM nuisance models throughout.
-Embeddings are frozen (no fine-tuning) and extracted once; every downstream
-stage runs on CPU.
+## Outputs
+`effects.csv`, `diagnostics.csv`, `contrasts.csv`, `cohorts.csv`, `synthetic.csv`,
+`robustness.csv`, `manifest.csv` — under `paths.storage_root/results`.
 
-## Data
+## Positive controls (both asserted in `integrity`; the run fails loudly if either breaks)
+1. **Real:** `structured` must reduce bias vs `naive` where overlap is adequate.
+2. **Synthetic:** `struct_img` must recover a known tau when the confounder is planted in
+   the image by construction.
 
-MIMIC-IV is credentialed patient data — access requires a PhysioNet data use
-agreement. Raw data and all derived tables are excluded from this repository
-via `.gitignore`.
-
-| Dataset | Version | Role |
-|---|---|---|
-| MIMIC-IV | 3.1 | Structured EHR (backbone) |
-| MIMIC-IV-ED | 2.2 | Emergency department covariates |
-| MIMIC-IV-Note | 2.2 | Free-text clinical notes |
-| MIMIC-CXR-JPG | 2.1.0 | Chest X-ray images + CheXpert labels |
-| eICU-CRD | 2.0 | External validation (structured only) |
-
-## Repository structure
-
-```
-.
-├── config.yaml              # Single source of truth: all paths, hyperparams,
-│                            #   intervention definitions, RCT reference values
-├── main_causal.py           # Sole entry point: --stage <name>|all [--intervention k]
-├── requirements.txt
-│
-├── src/
-│   ├── cfg.py               # config.yaml loader with ${ENV:default} interpolation
-│   ├── aipw.py              # Cross-fitted AIPW estimator
-│   ├── features.py          # Covariate assembly (structured + embedding pooling)
-│   ├── reduce.py            # Embedding dimensionality reduction (PCA / p-score)
-│   ├── stats.py             # Cluster bootstrap, BH-FDR, E-values, IF-CIs
-│   ├── results.py           # Output file schemas and writers
-│   ├── util.py              # Logging and checkpoint markers
-│   └── stages/
-│       ├── link.py          # §9.3  Verify MIMIC-IV × MIMIC-CXR linkage
-│       ├── extract_embeddings.py  # §9.4  RAD-DINO images + Clinical-Longformer notes
-│       ├── emulate.py       # §9.5  Target-trial cohort construction
-│       ├── probe.py         # §9.6  Validity gate: proxy → target confounder AUROC
-│       ├── estimate.py      # §9.7  AIPW effects for all conditions
-│       ├── demographics.py  # §9.10 Subgroup re-estimation (sex, age band)
-│       ├── robustness.py    # §9.11 Four sensitivity swaps
-│       ├── external.py      # §9.12 eICU replication (structured + notes)
-│       ├── consolidate.py   # §9.13 Merge into 10 result files
-│       └── integrity_check.py  # §9.14 Invariant assertions before sign-off
-│
-└── pipeline/                # One-time data preparation (SLURM batch jobs)
-    ├── build_link_layer.py  # Join MIMIC-IV patients × CXR studies → link/
-    ├── build_event_stream.py  # Unify time-series events → Parquet
-    ├── clean_event_stream.py  # Value cleaning and range filtering
-    └── qc_event_stream.py   # QC checks on the event stream
-```
-
-## Setup
-
-### 1. Install dependencies
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-For the embedding extraction step only (GPU node), additionally install:
-
-```bash
-pip install torch transformers pillow
-```
-
-### 2. Configure paths
-
-Edit `config.yaml` — all paths support `${ENV_VAR:default}` interpolation,
-so you can override them with environment variables without touching the file:
-
-```bash
-export CTFM_STORAGE=/path/to/storage   # where embeddings and results are written
-export CTFM_DATASETS=/path/to/datasets # where MIMIC-IV, MIMIC-CXR, etc. live
-```
-
-### 3. Run a stage
-
-```bash
-# Single stage
-python main_causal.py --stage link
-python main_causal.py --stage extract_embeddings
-python main_causal.py --stage emulate --intervention fluids_sepsis
-
-# Full pipeline (runs stages in order)
-python main_causal.py --stage all
-
-# Resume after interruption — each stage checkpoints internally
-python main_causal.py --stage estimate --intervention fluids_sepsis
-```
-
-All results are written to `paths.storage_root` (set in `config.yaml`),
-never inside the repository.
-
-## Design principles
-
-- **One config file.** `config.yaml` holds every path, hyperparameter,
-  intervention definition, and RCT reference value. Nothing is defined
-  anywhere else.
-- **No fabrication.** Every number in every result file is computed from
-  real data. Missing values are left explicitly empty, never filled with
-  estimates or placeholders.
-- **Time-zero discipline.** Only data strictly before time zero may enter
-  the adjustment set. Anything at or after leaks the outcome; this is
-  asserted in code, not just assumed.
-- **Compute discipline.** The only GPU-intensive step is the one-time
-  embedding extraction. Every subsequent stage runs on CPU.
-- **Checkpoint and resume.** Every stage writes progress markers so
-  interrupted cluster jobs resume rather than restart.
-
-
+A null from a pipeline not shown capable of detecting the thing it failed to find is worthless.

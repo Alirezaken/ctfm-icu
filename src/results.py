@@ -65,7 +65,7 @@ SCHEMAS: dict[str, list[str]] = {
            "min_detectable_effect_pp",
            "expert_confounders_extracted", "expert_confounders_requested"]
         + _kb("negative_control")
-        + ["e_value", "e_value_ci_limit"]
+        + ["e_value", "e_value_ci_limit", "undefined", "note"]
     ),
 
     # ---------------------------------------------------------------- 2

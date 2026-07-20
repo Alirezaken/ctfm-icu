@@ -42,6 +42,25 @@ from src.stats import (cluster_bootstrap_indices, bootstrap_summary, influence_f
                        standardized_mean_differences, e_value, e_value_ci_limit, round3)
 
 
+def _guard_impossible(cfg, row: dict) -> dict:
+    """A risk difference outside +/-100pp is not wide, it is impossible (Part 10 Rule 3).
+    Mirrors robustness.py's subgroup guard: blank the point/CI/bias/derived fields and
+    mark `undefined` rather than print a number that cannot exist."""
+    max_rd = float(cfg.get("demographics.max_abs_rd_pp", 100))
+    pt, lo, hi = row["effect_point"], row["effect_ci_low"], row["effect_ci_high"]
+    if not (abs(pt) > max_rd or abs(lo) > max_rd or abs(hi) > max_rd):
+        row["undefined"], row["note"] = False, ""
+        return row
+    for k in ("effect_point", "effect_mean", "effect_std", "effect_ci_low", "effect_ci_high",
+              "effect_if_ci_low", "effect_if_ci_high",
+              "bias_point", "bias_mean", "bias_std", "bias_ci_low", "bias_ci_high",
+              "divergence_z", "e_value", "e_value_ci_limit"):
+        row[k] = ""
+    row["undefined"] = True
+    row["note"] = f"estimate/CI exceeds +/-{max_rd:.0f}pp -- not estimable"
+    return row
+
+
 def build_conditions(cfg, cohort, S):
     """The seven design matrices. Embedding blocks are passed RAW; the reduction happens
     inside the estimator's cross-fitting loop (nested), never here."""
@@ -146,7 +165,7 @@ def _run_one(cfg, intervention):
         store[name] = {"psi": psi, "keep": keep, "boot": bvals, "point": point,
                        "ess": diag["ess"], "e": diag["e"]}
 
-        eff_rows.append({
+        eff_rows.append(_guard_impossible(cfg, {
             "intervention": intervention, "condition": name, "cohort": "imaged",
             "dataset": "mimic", "estimator": "aipw" if name != "naive" else "unadjusted",
             "reduction": cfg.reduction if blks else "",
@@ -172,7 +191,7 @@ def _run_one(cfg, intervention):
             **nc_eff.as_row("negative_control_"),
             "e_value": e_value(point, baseline_pct),
             "e_value_ci_limit": e_value_ci_limit(eff.ci_low, eff.ci_high, baseline_pct),
-        })
+        }))
 
         log(f"  {name:16s} RD={point:7.1f}  CI[{eff.ci_low:6.1f},{eff.ci_high:6.1f}]  "
             f"ATO={ato_pt:6.1f}  bias={point-ref_rd:+6.1f}  Z={zdiv}  ESS={round(diag['ess']):5d}")
@@ -299,7 +318,7 @@ def _scope_sensitivity(cfg, iv, full, cohort, ref_rd, ref_lo, ref_hi, ref_src, s
         ato = bootstrap_summary(diag["ato"], ato_b)
         bias = bootstrap_summary(pt - ref_rd, bt - ref_rd)
 
-        rows.append({
+        rows.append(_guard_impossible(cfg, {
             "intervention": iv, "condition": name, "cohort": "eligible", "dataset": "mimic",
             "estimator": "aipw" if name != "naive" else "unadjusted", "reduction": "",
             **e.as_row("effect_"), "effect_if_ci_low": if_lo, "effect_if_ci_high": if_hi,
@@ -317,7 +336,7 @@ def _scope_sensitivity(cfg, iv, full, cohort, ref_rd, ref_lo, ref_hi, ref_src, s
             "n_analyzed": diag["n"], "n_active": int(A.sum()),
             "n_comparator": int((A == 0).sum()), "n_events": int(Y.sum()),
             "min_detectable_effect_pp": minimum_detectable_effect(psi, keep),
-        })
+        }))
         if name == "structured" and "structured" in store:
             shift = round(store["structured"]["point"] - pt, 1)
             coh_rows.append({

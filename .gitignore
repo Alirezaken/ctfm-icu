@@ -1,7 +1,8 @@
 # --- Data: MIMIC is credentialed PHI -- NEVER commit to git ---
 /Datasets/
 /data/
-/ctfm_storage/          # storage_root (if ever placed in-repo): results, embeddings, patient tables
+# storage_root (if ever placed in-repo): results, embeddings, patient tables
+/ctfm_storage/
 *.parquet
 *.csv
 *.csv.gz
@@ -28,8 +29,9 @@ __pycache__/
 /docs/
 # ... and any stray markdown anywhere ...
 *.md
-# ... except a single top-level README.md, committed separately.
+# ... except the project README(s), committed separately.
 !/README.md
+!/ctfm-icu/README.md
 
 # --- misc ---
 .DS_Store

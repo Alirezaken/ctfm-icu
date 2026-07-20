@@ -71,7 +71,10 @@ def _frontal_image_table(cfg, subjects):
 
     root = str(cfg.input("cxr_images"))
     rel = next((c for c in ("jpg_rel_path", "path", "img_rel_path") if c in m.columns), None)
-    m["abs_path"] = root + "/" + m[rel].astype(str)
+    # cxr_images (Datasets/preprocessed) holds the pXX/... tree directly, without the
+    # "mimic-cxr-jpg/files/" prefix that mimic_master_list.csv's path column carries.
+    relpath = m[rel].astype(str).str.replace(r"^mimic-cxr-jpg/files/", "", regex=True)
+    m["abs_path"] = root + "/" + relpath
     m["shard"] = "p" + m["subject_id"].astype(str).str.slice(0, 2)
     m["source_id"] = m["dicom_id"] if "dicom_id" in m.columns else m[rel]
     return m[["subject_id", "source_id", "ts", "abs_path", "shard"]].reset_index(drop=True)

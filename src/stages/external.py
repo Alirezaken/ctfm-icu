@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 from src.util import log, die
-from src import aipw, results as R
+from src import results as R
 from src.stats import cluster_bootstrap_indices, bootstrap_summary, influence_function_ci
 
 # APACHE first-day physiology used as the structured set (no treatment-derived
@@ -238,6 +238,7 @@ def _one(cfg, intervention, spine, aps):
                            influence_function_ci, divergence_z, ci_overlaps,
                            minimum_detectable_effect, round3)
     from src import estimator as EST
+    from src.stages import estimate as EE
 
     spec = cfg.get(f"interventions.{intervention}")
     horizon_min = int(spec["horizon_days"]) * 1440.0
@@ -285,7 +286,7 @@ def _one(cfg, intervention, spine, aps):
         ato = bootstrap_summary(diag["ato"], ato_b)
         bias = bootstrap_summary(pt - ref_rd, bt - ref_rd)
 
-        rows.append({
+        rows.append(EE._guard_impossible(cfg, {
             "intervention": intervention, "condition": name, "cohort": "eicu_all",
             "dataset": "eicu",
             "estimator": "aipw" if name != "naive" else "unadjusted", "reduction": "",
@@ -305,7 +306,7 @@ def _one(cfg, intervention, spine, aps):
             "n_analyzed": diag["n"], "n_active": int(A.sum()),
             "n_comparator": int((A == 0).sum()), "n_events": int(Y.sum()),
             "min_detectable_effect_pp": minimum_detectable_effect(psi, keep),
-        })
+        }))
         log(f"    {name:12s} RD={pt:7.1f}  CI[{e.ci_low:6.1f},{e.ci_high:6.1f}]  "
             f"bias={pt-ref_rd:+6.1f}  ESS={round(diag['ess'])}")
     return rows
