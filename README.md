@@ -1,4 +1,4 @@
-# RCT-Anchored Audit of Multimodal Causal Adjustment in the ICU
+# Foundation-model embeddings predict the confounder but do not reduce confounding bias in critical care
 
 ## Overview
 
