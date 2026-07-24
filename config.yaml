@@ -9,41 +9,41 @@
 # PATHS
 # ======================================================================
 paths:
-  storage_root: ${CTFM_STORAGE:/home/woody/iwi5/iwi5406h/ctfm_storage}
+  storage_root: ${CTFM_STORAGE:/PATH/ctfm_storage}
 
   # ---- inputs (raw data, read-only) ----
-  datasets_dir: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}
-  data_dir:     ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}
-  link_dir:     ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/link
-  event_stream_raw: ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/event_stream
-  event_stream:     ${CTFM_DATA:/home/woody/iwi5/iwi5406h/New_Sp/data}/event_stream_clean
+  datasets_dir: ${CTFM_DATASETS:/PATH/New_Sp/Datasets}
+  data_dir:     ${CTFM_DATA:/PATH/New_Sp/data}
+  link_dir:     ${CTFM_DATA:/PATH/New_Sp/data}/link
+  event_stream_raw: ${CTFM_DATA:/PATH/New_Sp/data}/event_stream
+  event_stream:     ${CTFM_DATA:/PATH/New_Sp/data}/event_stream_clean
 
-  mimic_dir:  ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/mimiciv/3.1
-  ed_dir:     ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/mimic-iv-ed/2.2/ed
-  notes_dir:  ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/mimic-iv-note/2.2
-  eicu_dir:   ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/physionet.org/files/eicu-crd/2.0
-  cxr_master: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/mimic_master_list.csv
-  cxr_images: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/preprocessed
+  mimic_dir:  ${CTFM_DATASETS:/PATH/New_Sp/Datasets}/physionet.org/files/mimiciv/3.1
+  ed_dir:     ${CTFM_DATASETS:/PATH/New_Sp/Datasets}/physionet.org/files/mimic-iv-ed/2.2/ed
+  notes_dir:  ${CTFM_DATASETS:/PATH/New_Sp/Datasets}/physionet.org/files/mimic-iv-note/2.2
+  eicu_dir:   ${CTFM_DATASETS:/PATH/New_Sp/Datasets}/physionet.org/files/eicu-crd/2.0
+  cxr_master: ${CTFM_DATASETS:/PATH/New_Sp/Datasets}/mimic_master_list.csv
+  cxr_images: ${CTFM_DATASETS:/PATH/New_Sp/Datasets}/preprocessed
 
   # external CXR sets -- embedding QUALITY GATE only, never enter the causal models
   external_cxr:
     padchest:
-      csv:         /home/hpc/iwi5/iwi5406h/fix10april/Project/padchest_trainval.csv
-      images_root: /home/vault/iwi5/iwi5406h/preprocessed_Padchest
+      csv:         /PATH/padchest_trainval.csv
+      images_root: /PATH/preprocessed_Padchest
       id_col:      ImageID
       view_col:    view
       path:        "{images_root}/{ImageDir}/{ImageID}"
       label_map:   {edema: pulmonary_edema, effusion: pleural_effusion, cardiomegaly: cardiomegaly}
     chestxray14:
-      csv:         ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/final_cxr14_master_list.csv
-      images_root: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/chestxray14/preprocessed
+      csv:         ${CTFM_DATASETS:/PATH/New_Sp/Datasets}/final_cxr14_master_list.csv
+      images_root: ${CTFM_DATASETS:/PATH/New_Sp/Datasets}/chestxray14/preprocessed
       id_col:      image_id
       view_col:    view_position
       path:        "{images_root}/{img_rel_path}"
       label_map:   {edema: edema, effusion: effusion, cardiomegaly: cardiomegaly}
     chexpert:
-      csv:         ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/chexpert_gate_master.csv
-      images_root: ${CTFM_DATASETS:/home/woody/iwi5/iwi5406h/New_Sp/Datasets}/preprocessed_chxpert
+      csv:         ${CTFM_DATASETS:/PATH/New_Sp/Datasets}/chexpert_gate_master.csv
+      images_root: ${CTFM_DATASETS:/PATH/New_Sp/Datasets}/preprocessed_chxpert
       id_col:      image_id
       view_col:    AP_PA
       path:        "{images_root}/{img_path}"

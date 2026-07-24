@@ -35,3 +35,6 @@ __pycache__/
 
 # --- misc ---
 .DS_Store
+*.xml
+*.iml
+/.idea/*
