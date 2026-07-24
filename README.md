@@ -5,21 +5,18 @@
 Foundation-model embeddings of chest X-rays and clinical text are increasingly proposed as
 confounder proxies for causal inference on EHR data — the intuition being that a richer,
 validated representation of a patient's state should adjust away more bias than the
-structured record alone. This repository audits that intuition directly, using target-trial
-emulation anchored to four completed RCTs (PROSEVA, CLOVERS/CLASSIC, STARRT-AKI, TRISS) as
-ground truth.
+structured record alone. This repository implements an audit of that intuition: target-trial
+emulation of four ICU interventions, each anchored to a completed RCT (PROSEVA,
+CLOVERS/CLASSIC, STARRT-AKI, TRISS) as ground truth, with cross-fitted doubly-robust
+estimation run under seven adjustment conditions per intervention — naive, structured-only,
+and structured plus each candidate embedding — to isolate exactly what each modality adds on
+top of the structured record.
 
-**Finding:** a validated embedding is not a valid confounder proxy. The image and text
-embeddings (RAD-DINO, Clinical-Longformer) are highly informative about the confounders they
-are meant to proxy — externally replicated at AUROC 76–94 — yet adding them to the adjustment
-set reduces confounding bias by zero (incremental confounding index −0.23 to +1.30, all near
-zero) beyond what the structured EHR record already provides, because the confounding
-information is redundant with, not additional to, the structured record. For the
-positivity-constrained intervention, adding the image also destroys effective sample size. A
-semi-synthetic benchmark with a known planted effect confirms the mechanism is redundancy,
-not weak signal: the same pipeline **does** recover a known effect when the confounder is
-planted in the image by construction. **Overlap, not proxy richness, is the binding
-constraint on EHR causal inference.**
+A pre-estimation diagnostic and a semi-synthetic benchmark with a known planted effect are
+built into the pipeline specifically so that a null result can be distinguished from a broken
+or underpowered one. External replication on eICU-CRD, and an image-embedding
+informativeness gate on PadChest / ChestX-ray14 / CheXpert, complete the validation. Results
+are reported in the accompanying study, not here.
 
 ## Method
 
@@ -45,7 +42,7 @@ constraint on EHR causal inference.**
 | Intervention | RCT anchor | RCT effect (RD, 95% CI) | Horizon | Role |
 |---|---|---|---|---|
 | `fluids_sepsis` | CLOVERS / CLASSIC (meta) | −0.6 pp [−3.4, 2.3] | 90d | Primary null calibration — best n, best overlap |
-| `transfusion_threshold` | TRISS (TRICC as sensitivity) | −1.9 pp [−8.1, 4.2] | 90d | Null calibration — key confounder (Hb) is structured, so imaging must not help |
+| `transfusion_threshold` | TRISS (TRICC as sensitivity) | −1.9 pp [−8.1, 4.2] | 90d | Null calibration — key confounder (hemoglobin) is already in the structured record |
 | `rrt_timing` | STARRT-AKI | +0.2 pp [−0.3, 0.4] | 90d | Null calibration — tests whether "urgency" information lives in text |
 | `prone_positioning` | PROSEVA | −16.8 pp [−24.5, −9.1] | 28d | Positive control; pre-specified positivity-failure case |
 
