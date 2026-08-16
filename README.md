@@ -1,12 +1,8 @@
-# Foundation model embeddings predict the confounder but struggle in reducing confounding bias in critical care
+# The Incremental Confounding Index shows that detecting disease is not removing confounding in intensive care
 
 ## Overview
 
-This is the official repository of the paper **Foundation model embeddings predict the confounder but struggle in reducing confounding bias in critical care**.
-
-Preprint version: [link to be added].
-
-Foundation-model embeddings of chest X-rays and clinical notes are increasingly proposed as confounder proxies for causal adjustment in observational ICU studies, on the intuition that a richer, validated representation of a patient's clinical state should absorb more confounding than the structured record alone. This repository is the code for an audit of that intuition. It emulates four ICU target trials, each anchored to a completed randomized controlled trial (PROSEVA, CLOVERS/CLASSIC, STARRT-AKI, TRISS), so that adjustment quality can be checked against real trial evidence rather than against internal consistency alone. Each target trial is estimated under seven adjustment conditions — a naive comparison, a clinician-curated expert confounder set, adjustment on the full structured EHR record, adjustment on that record plus each of three candidate embeddings (a chest-X-ray encoder and two clinical-text encoders), and all three embeddings together — using cross-fitted, doubly robust estimation. A pre-estimation diagnostic and a semi-synthetic benchmark with a known, planted effect are built into the pipeline so that a null finding can be told apart from a pipeline that simply is not working. External replication on an independent multi-hospital ICU database, and an image-embedding quality gate on public chest-X-ray datasets, complete the validation. The findings are reported in the accompanying manuscript; this repository documents the method and reproduces the pipeline, not the findings.
+This is the official repository of the paper **The Incremental Confounding Index shows that detecting disease is not removing confounding in intensive care**.
 
 ## Encoder panel
 
@@ -27,10 +23,6 @@ The image-embedding quality gate additionally applies the same frozen RAD-DINO e
 
 ```bash
 git clone https://github.com/Alirezaken/ctfm-icu.git
-cd ctfm-icu
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 ```
 
 The core pipeline (data preparation, estimation, diagnostics) uses pandas, PyArrow, NumPy, PyYAML, LightGBM, scikit-learn, and SciPy. The single GPU stage that extracts embeddings additionally needs PyTorch, Hugging Face Transformers, Pillow, and open_clip_torch (for the BiomedCLIP encoder swap); these are commented out in `requirements.txt` and installed on the GPU node only.
@@ -63,7 +55,7 @@ Every per-intervention stage runs all four target trials by default; pass `--int
 
 **Resume caveat.** Stages checkpoint per unit of work and skip units already finished on restart, because these jobs sit in a SLURM queue and get preempted. Resume cannot detect code changes: if you edit a stage, re-run it with `--force`, or delete its checkpoint markers, so it recomputes rather than skipping finished units and keeping stale numbers.
 
-### Data preparation (CPU)
+### Data preparation
 
 The relational link layer and the unified event stream are built once from the raw PhysioNet tables by the scripts in `pipeline/`; the `link` stage then verifies they are present before the study proper begins.
 
@@ -72,7 +64,7 @@ python main.py --stage link       # verify the link layer and event stream are p
 python main.py --stage emulate    # build the four target-trial cohorts: eligibility, arms, time zero, censoring
 ```
 
-### Extract embeddings (GPU)
+### Extract embeddings
 
 ```bash
 python main.py --stage extract_embeddings   # image and text embeddings for the cohort
@@ -81,7 +73,7 @@ python main.py --stage extract_external     # RAD-DINO embeddings for the image-
 
 The only GPU stages. Both checkpoint per shard, so a preempted job resumes rather than restarts.
 
-### Estimation and validation (CPU)
+### Estimation and validation
 
 ```bash
 python main.py --stage estimate      # the seven adjustment conditions per target trial
@@ -91,7 +83,7 @@ python main.py --stage robustness    # encoder / estimator / window / pooling / 
 python main.py --stage external      # structured-only replication on the external ICU database
 ```
 
-### Consolidation and integrity (CPU)
+### Consolidation and integrity
 
 ```bash
 python main.py --stage consolidate   # assemble every paired contrast, with p-values and BH-FDR
@@ -120,10 +112,9 @@ If you use this repository, please cite our paper:
 
 ```bibtex
 @misc{sharafiyan2026foundation,
-  title  = {Foundation model embeddings predict the confounder but struggle in reducing confounding bias in critical care},
+  title  = {The Incremental Confounding Index shows that detecting disease is not removing confounding in intensive care},
   author = {Sharafiyan, Alireza and Kuhl, Christiane and Alhaskir, Mohamed and Bienzeisler, Jonas and Maier, Andreas and Kather, Jakob Nikolas and Nebelung, Sven and Truhn, Daniel and Tayebi Arasteh, Soroosh},
   year   = {2026},
-  note   = {Preprint}
 }
 ```
 
